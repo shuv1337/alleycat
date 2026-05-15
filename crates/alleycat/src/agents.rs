@@ -11,10 +11,13 @@ use alleycat_opencode_bridge::OpencodeBridge;
 use alleycat_pi_bridge::PiBridge;
 use anyhow::{Context, anyhow};
 use arc_swap::ArcSwap;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
+use futures::{SinkExt, StreamExt};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, OnceCell};
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
 use crate::config::HostConfig;
@@ -172,10 +175,11 @@ impl AgentManager {
             AgentInfo {
                 name: "codex".to_string(),
                 display_name: "Codex".to_string(),
-                wire: match self.codex_mode {
-                    CodexMode::Websocket => AgentWire::Websocket,
-                    CodexMode::Stdio => AgentWire::Jsonl,
-                },
+                // Alleycat clients always speak JSON-RPC/JSONL after the iroh
+                // connect response. When the local Codex binary supports the
+                // shared websocket app-server, the daemon terminates the
+                // websocket locally and bridges frames to JSONL for clients.
+                wire: AgentWire::Jsonl,
                 available: self.codex_available(),
             },
             AgentInfo {
@@ -210,8 +214,8 @@ impl AgentManager {
     ) -> anyhow::Result<()> {
         match agent {
             // Codex doesn't participate in the JSON-RPC replay scheme —
-            // each iroh stream is a fresh websocket client to the shared
-            // codex app-server, and codex has its own resume semantics
+            // each iroh stream is bridged to a fresh websocket client on the
+            // shared codex app-server, and codex has its own resume semantics
             // (SQLite session store). The session is held just so the
             // registry's accounting stays uniform; its ring stays empty.
             "codex" => {
@@ -287,13 +291,51 @@ impl AgentManager {
         }
     }
 
-    async fn serve_codex_ws(&self, mut iroh_stream: IrohStream) -> anyhow::Result<()> {
+    async fn serve_codex_ws(&self, iroh_stream: IrohStream) -> anyhow::Result<()> {
         let (host, port) = self.ensure_codex_running().await?;
-        let mut tcp = TcpStream::connect((host.as_str(), port))
+        let url = format!("ws://{host}:{port}");
+        let (ws, _) = connect_async(&url)
             .await
-            .with_context(|| format!("connecting to codex app-server at {host}:{port}"))?;
-        let _ = tokio::io::copy_bidirectional(&mut iroh_stream, &mut tcp).await;
-        Ok(())
+            .with_context(|| format!("connecting to codex app-server at {url}"))?;
+        let (mut ws_write, mut ws_read) = ws.split();
+        let (iroh_read, mut iroh_write) = tokio::io::split(iroh_stream);
+        let mut iroh_lines = BufReader::new(iroh_read).lines();
+
+        let client_to_codex = async {
+            while let Some(line) = iroh_lines.next_line().await? {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                ws_write.send(Message::Text(line.into())).await?;
+            }
+            let _ = ws_write.close().await;
+            anyhow::Ok(())
+        };
+
+        let codex_to_client = async {
+            while let Some(message) = ws_read.next().await {
+                match message? {
+                    Message::Text(text) => {
+                        iroh_write.write_all(text.as_bytes()).await?;
+                        iroh_write.write_all(b"\n").await?;
+                        iroh_write.flush().await?;
+                    }
+                    Message::Binary(bytes) => {
+                        iroh_write.write_all(&bytes).await?;
+                        iroh_write.write_all(b"\n").await?;
+                        iroh_write.flush().await?;
+                    }
+                    Message::Close(_) => break,
+                    Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => {}
+                }
+            }
+            anyhow::Ok(())
+        };
+
+        tokio::select! {
+            result = client_to_codex => result,
+            result = codex_to_client => result,
+        }
     }
 
     /// Per-stream stdio bridge for codex versions that don't support

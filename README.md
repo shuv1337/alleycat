@@ -56,7 +56,7 @@ The daemon talks to the CLI over a Unix domain socket on macOS/Linux and a per-u
 
 | Agent | Spawned by daemon? | How |
 |---|---|---|
-| `codex` | Yes, one shared backend | Lazy spawn of `codex app-server --listen ws://<host>:<port>` on first `connect`. The child is kept alive for the daemon lifetime; each iroh stream becomes a fresh websocket client and conversations persist independently of any single client. |
+| `codex` | Yes, one shared backend | Lazy spawn of `codex app-server --listen ws://<host>:<port>` on first `connect`. The child is kept alive for the daemon lifetime; Alleycat terminates the local websocket and exposes JSON-RPC/JSONL over each iroh stream so clients do not need to perform a websocket handshake. Conversations persist independently of any single client. |
 | `pi` | Yes, per codex thread | `PiPool` spawns `pi --mode rpc` on demand, bounded at 16 processes with a 10-minute idle reap and LRU eviction. |
 | `opencode` | Yes, one shared backend | Lazy spawn of `opencode serve --port=auto --auth-token=auto` on first connect, gated on `/global/health`. Or set `OPENCODE_BRIDGE_BACKEND_URL` to point at an existing instance. |
 | `claude` | Yes, per codex thread | `ClaudePool` spawns `claude -p --input-format stream-json --output-format stream-json --session-id <thread_id> --dangerously-skip-permissions` on demand. Same 16-cap, 10-minute idle reap, LRU eviction as pi. Sessions resume on next access via `--resume <thread_id>`. |
@@ -88,7 +88,7 @@ or
 {"op": "connect", "v": 1, "token": "...", "agent": "codex"}
 ```
 
-The daemon answers with `{ok, agents?, error?}`. On `connect`, after the response the stream becomes the agent's native wire — websocket frames for `codex` (the daemon proxies straight to the shared `codex app-server` listener), JSON-RPC over JSONL for `pi`, `opencode`, and `claude`.
+The daemon answers with `{ok, agents?, error?}`. On `connect`, after the response the stream carries JSON-RPC over JSONL for all agents. For Codex, the daemon connects to the shared local `codex app-server` websocket itself and translates websocket text frames to newline-delimited JSON for the iroh client.
 
 ## Configuration
 
