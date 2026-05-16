@@ -193,18 +193,39 @@ impl Default for DroidAgentConfig {
 #[serde(default)]
 pub struct HermesAgentConfig {
     pub enabled: bool,
+    /// Connection mode: `auto`, `api`, or `cli`.
+    /// - `auto` (default): try gateway first, fall back to CLI if unhealthy.
+    /// - `api`: gateway only; never fall back to CLI; failures are surfaced.
+    /// - `cli`: skip gateway probe entirely.
+    pub mode: HermesModeKind,
     /// Hermes CLI binary used for fallback mode.
     pub bin: String,
     /// Loopback Hermes gateway API base URL.
     pub api_base: String,
+    /// Timeout for the `/health` probe in milliseconds.
+    pub health_timeout_ms: u64,
+    /// TTL for cached health/availability decisions, in milliseconds.
+    pub health_cache_ttl_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum HermesModeKind {
+    #[default]
+    Auto,
+    Api,
+    Cli,
 }
 
 impl Default for HermesAgentConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            mode: HermesModeKind::Auto,
             bin: "hermes".to_string(),
             api_base: "http://127.0.0.1:8642".to_string(),
+            health_timeout_ms: 1000,
+            health_cache_ttl_ms: 2000,
         }
     }
 }
@@ -364,6 +385,9 @@ mod tests {
         assert!(config.agents.droid.enabled);
         assert!(config.agents.grok.enabled);
         assert!(config.agents.grok.no_leader);
-        assert_eq!(config.agents.grok.reasoning_effort.as_deref(), Some("medium"));
+        assert_eq!(
+            config.agents.grok.reasoning_effort.as_deref(),
+            Some("medium")
+        );
     }
 }

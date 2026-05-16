@@ -35,11 +35,36 @@ impl Default for HermesMode {
 }
 
 /// Top-level configuration for the Hermes bridge.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HermesBridgeConfig {
     #[serde(default)]
     pub mode: HermesMode,
-    /// Directory for persistent state (thread index, etc.).
+    /// Directory for persistent state (thread index, runs, events).
     #[serde(default)]
     pub state_dir: Option<String>,
+    /// Timeout for `/health` probes, milliseconds.
+    #[serde(default = "default_health_timeout_ms")]
+    pub health_timeout_ms: u64,
+    /// TTL for cached availability decisions, milliseconds.
+    #[serde(default = "default_health_cache_ttl_ms")]
+    pub health_cache_ttl_ms: u64,
+}
+
+fn default_health_timeout_ms() -> u64 {
+    1000
+}
+
+fn default_health_cache_ttl_ms() -> u64 {
+    2000
+}
+
+impl Default for HermesBridgeConfig {
+    fn default() -> Self {
+        Self {
+            mode: HermesMode::default(),
+            state_dir: None,
+            health_timeout_ms: default_health_timeout_ms(),
+            health_cache_ttl_ms: default_health_cache_ttl_ms(),
+        }
+    }
 }

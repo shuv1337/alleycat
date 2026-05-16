@@ -63,6 +63,7 @@ fn config_from_env() -> HermesBridgeConfig {
     HermesBridgeConfig {
         mode,
         state_dir: std::env::var("HERMES_BRIDGE_STATE_DIR").ok(),
+        ..Default::default()
     }
 }
 

@@ -19,9 +19,15 @@ mod api_client;
 mod bridge;
 mod cli_adapter;
 mod config;
+mod event_store;
+mod health_cache;
 mod index;
+mod run_manager;
+mod run_state;
 mod sse;
 mod state;
 
 pub use bridge::HermesBridge;
 pub use config::{HermesBridgeConfig, HermesMode};
+pub use event_store::{EventStore, NormalizedHermesEvent};
+pub use run_state::{HermesRunRecord, HermesTurnStatus, RunStore};

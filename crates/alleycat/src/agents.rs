@@ -11,8 +11,8 @@ use alleycat_bridge_core::session::{Session, SessionRegistry, SessionRegistryCon
 use alleycat_bridge_core::{Bridge, LocalLauncher};
 use alleycat_claude_bridge::ClaudeBridge;
 use alleycat_devin_bridge::DevinBridge;
-use alleycat_grok_bridge::GrokBridge;
 use alleycat_droid_bridge::DroidBridge;
+use alleycat_grok_bridge::GrokBridge;
 use alleycat_hermes_bridge::{HermesBridge, HermesBridgeConfig};
 use alleycat_opencode_bridge::OpencodeBridge;
 use alleycat_pi_bridge::PiBridge;
@@ -229,14 +229,34 @@ impl AgentManager {
         bridges.insert(AgentKind::Grok, grok_bridge);
 
         let hermes_cfg = &snapshot.agents.hermes;
-        let hermes_bridge_cfg = HermesBridgeConfig {
-            mode: alleycat_hermes_bridge::HermesMode::Auto {
+        let hermes_mode = match hermes_cfg.mode {
+            crate::config::HermesModeKind::Auto => alleycat_hermes_bridge::HermesMode::Auto {
                 api_base: hermes_cfg.api_base.clone(),
                 bin: Some(hermes_cfg.bin.clone()),
             },
-            state_dir: codex_home
-                .as_ref()
-                .map(|p| p.join("hermes-bridge").to_string_lossy().to_string()),
+            crate::config::HermesModeKind::Api => alleycat_hermes_bridge::HermesMode::Api {
+                api_base: hermes_cfg.api_base.clone(),
+            },
+            crate::config::HermesModeKind::Cli => alleycat_hermes_bridge::HermesMode::Cli {
+                bin: Some(hermes_cfg.bin.clone()),
+            },
+        };
+        // Prefer the explicit `CODEX_HOME` location; otherwise fall back to
+        // Alleycat's own state dir so Hermes turns survive daemon restarts
+        // even without `CODEX_HOME` set.
+        let hermes_state_dir = codex_home
+            .as_ref()
+            .map(|p| p.join("hermes-bridge"))
+            .or_else(|| {
+                crate::paths::state_dir()
+                    .ok()
+                    .map(|p| p.join("hermes-bridge"))
+            });
+        let hermes_bridge_cfg = HermesBridgeConfig {
+            mode: hermes_mode,
+            state_dir: hermes_state_dir.map(|p| p.to_string_lossy().to_string()),
+            health_timeout_ms: hermes_cfg.health_timeout_ms,
+            health_cache_ttl_ms: hermes_cfg.health_cache_ttl_ms,
         };
         bridges.insert(
             AgentKind::Hermes,
@@ -930,24 +950,63 @@ impl AgentManager {
     }
 
     async fn hermes_available(&self) -> bool {
-        let (enabled, bin, api_base) = {
+        let (enabled, mode, bin, api_base, timeout_ms) = {
             let cfg = self.config.load();
             (
                 cfg.agents.hermes.enabled,
+                cfg.agents.hermes.mode,
                 cfg.agents.hermes.bin.clone(),
                 cfg.agents.hermes.api_base.clone(),
+                cfg.agents.hermes.health_timeout_ms,
             )
         };
-        enabled && (which::which(&bin).is_ok() || hermes_api_available(&api_base).await)
+        if !enabled {
+            return false;
+        }
+        match mode {
+            crate::config::HermesModeKind::Cli => which::which(&bin).is_ok(),
+            crate::config::HermesModeKind::Api => hermes_api_available(&api_base, timeout_ms).await,
+            crate::config::HermesModeKind::Auto => {
+                hermes_api_available(&api_base, timeout_ms).await || which::which(&bin).is_ok()
+            }
+        }
     }
 }
 
-async fn hermes_api_available(api_base: &str) -> bool {
+async fn hermes_api_available(api_base: &str, timeout_ms: u64) -> bool {
     let url = format!("{}/health", api_base.trim_end_matches('/'));
-    matches!(
-        tokio::time::timeout(Duration::from_millis(300), reqwest::get(url)).await,
-        Ok(Ok(response)) if response.status().is_success()
-    )
+    let timeout = Duration::from_millis(timeout_ms.max(50));
+    let resp = match tokio::time::timeout(timeout, reqwest::get(&url)).await {
+        Ok(Ok(resp)) => resp,
+        Ok(Err(err)) => {
+            tracing::debug!(api_base = %api_base, error = %err, "hermes health check transport error");
+            return false;
+        }
+        Err(_) => {
+            tracing::debug!(api_base = %api_base, timeout_ms = timeout_ms, "hermes health check timeout");
+            return false;
+        }
+    };
+    if !resp.status().is_success() {
+        tracing::debug!(api_base = %api_base, status = %resp.status(), "hermes health check non-success");
+        return false;
+    }
+    // Best-effort JSON parse: require `status == "ok"` if JSON is returned.
+    // Some deployments may return a non-JSON 200; fall back to status-only.
+    match resp.json::<serde_json::Value>().await {
+        Ok(value) => {
+            let ok = value
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .map(|s| s.eq_ignore_ascii_case("ok"))
+                .unwrap_or(true); // unknown shape -> trust the 200
+            if !ok {
+                tracing::debug!(api_base = %api_base, body = %value, "hermes health check status field not ok");
+            }
+            ok
+        }
+        Err(_) => true, // non-JSON body, 200 is enough
+    }
 }
 
 fn codex_command(bin: &Path) -> Command {
@@ -1266,7 +1325,9 @@ fn resolve_pi_bin(configured: &str) -> Option<PathBuf> {
         return Some(path);
     }
     for alias in ["pi", "pi-coding-agent"] {
-        if alias != configured && let Some (path) = which::which(alias).ok() {
+        if alias != configured
+            && let Some(path) = which::which(alias).ok()
+        {
             return Some(path);
         }
     }

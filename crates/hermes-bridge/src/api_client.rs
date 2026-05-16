@@ -50,6 +50,68 @@ pub struct CreateRunResponse {
     pub session_id: Option<String>,
 }
 
+/// Decision payload for `POST /v1/runs/{run_id}/approval`.
+///
+/// Gateway accepts `once | session | always | deny` plus the aliases
+/// `approve | approved | allow` for `once`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApprovalChoice {
+    Once,
+    Session,
+    Always,
+    Deny,
+}
+
+impl ApprovalChoice {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ApprovalChoice::Once => "once",
+            ApprovalChoice::Session => "session",
+            ApprovalChoice::Always => "always",
+            ApprovalChoice::Deny => "deny",
+        }
+    }
+}
+
+/// Response from `GET /v1/runs/{run_id}` — pollable run status.
+///
+/// Persists for `_RUN_STATUS_TTL` (~3600s) after terminal state, so we can
+/// recover terminal output even after the SSE queue is gone.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+pub struct RunStatusResponse {
+    #[serde(alias = "runId")]
+    pub run_id: String,
+    /// Gateway-defined status: `queued`, `running`, `stopping`, `completed`,
+    /// `failed`, `cancelled`.
+    pub status: String,
+    #[serde(default, alias = "sessionId")]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub last_event: Option<String>,
+    /// Final assistant output, present once the run has reached a terminal
+    /// state with content.
+    #[serde(default)]
+    pub output: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub usage: Option<Value>,
+    #[serde(default, alias = "createdAt")]
+    pub created_at: Option<f64>,
+    #[serde(default, alias = "updatedAt")]
+    pub updated_at: Option<f64>,
+}
+
+impl RunStatusResponse {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self.status.as_str(), "completed" | "failed" | "cancelled")
+    }
+}
+
 /// A single Hermes SSE frame parsed from `event:` + `data:` lines.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HermesEvent {
@@ -191,14 +253,31 @@ impl HermesApiClient {
     }
 
     /// Resolve a pending tool approval for a running turn.
+    #[allow(dead_code)]
     pub async fn approve_run_once(&self, run_id: &str) -> Result<()> {
+        self.resolve_run_approval(run_id, ApprovalChoice::Once, false)
+            .await
+    }
+
+    /// Submit an approval decision for a running turn. `resolve_all` requests
+    /// the gateway clear every pending approval request in the same session.
+    pub async fn resolve_run_approval(
+        &self,
+        run_id: &str,
+        choice: ApprovalChoice,
+        resolve_all: bool,
+    ) -> Result<()> {
         let url = format!("{}/v1/runs/{}/approval", self.base_url, run_id);
         let mut req = self.client.post(&url);
         if let Some(ref key) = self.api_key {
             req = req.bearer_auth(key);
         }
+        let body = serde_json::json!({
+            "choice": choice.as_str(),
+            "resolve_all": resolve_all,
+        });
         let resp = req
-            .json(&serde_json::json!({ "choice": "once" }))
+            .json(&body)
             .send()
             .await
             .with_context(|| "POST /v1/runs/{id}/approval")?;
@@ -207,6 +286,31 @@ impl HermesApiClient {
             anyhow::bail!("approve run failed: {}", status);
         }
         Ok(())
+    }
+
+    /// Fetch the pollable run status. Returns `Ok(None)` on `404 run_not_found`.
+    pub async fn get_run_status(&self, run_id: &str) -> Result<Option<RunStatusResponse>> {
+        let url = format!("{}/v1/runs/{}", self.base_url, run_id);
+        let mut req = self.client.get(&url);
+        if let Some(ref key) = self.api_key {
+            req = req.bearer_auth(key);
+        }
+        let resp = req
+            .send()
+            .await
+            .with_context(|| format!("GET /v1/runs/{}", run_id))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            anyhow::bail!("get run status failed: {}", status);
+        }
+        let body: RunStatusResponse = resp
+            .json()
+            .await
+            .with_context(|| "parsing run status response")?;
+        Ok(Some(body))
     }
 }
 
