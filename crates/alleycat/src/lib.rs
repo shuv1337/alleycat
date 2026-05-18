@@ -9,6 +9,7 @@ mod config;
 mod daemon;
 mod framing;
 mod host;
+mod http_server;
 mod ipc;
 mod paths;
 mod protocol;
@@ -111,7 +112,7 @@ struct Cli {
 enum Command {
     /// Run the long-running daemon. Owns the iroh endpoint, the persistent
     /// identity, and the IPC control socket.
-    Serve,
+    Serve(daemon::ServeArgs),
     /// Install the OS-appropriate autostart entry (launchd / systemd-user /
     /// Windows Startup folder). Does not require admin.
     Install,
@@ -151,7 +152,7 @@ async fn async_main() -> anyhow::Result<()> {
             init_cli_logging();
             cli::onboarding::run().await
         }
-        Some(Command::Serve) => daemon::run().await,
+        Some(Command::Serve(args)) => daemon::run(args).await,
         Some(Command::Install) => {
             init_cli_logging();
             service::install()?;

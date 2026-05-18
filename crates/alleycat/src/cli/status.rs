@@ -42,6 +42,9 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
         "  relay:             {}",
         info.relay.as_deref().unwrap_or("<iroh default>")
     );
+    if let Some(endpoint) = &info.http_endpoint {
+        println!("  http endpoint:     {endpoint}");
+    }
     println!("  config:            {}", info.config_path);
     if info.uptime_secs > 0 {
         println!("  uptime (s):        {}", info.uptime_secs);
@@ -80,5 +83,6 @@ async fn offline_status() -> anyhow::Result<StatusInfo> {
         uptime_secs: 0,
         agents: agent_list,
         version: Some(crate::binary_version().to_string()),
+        http_endpoint: None,
     })
 }

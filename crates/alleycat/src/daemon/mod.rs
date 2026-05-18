@@ -8,12 +8,15 @@
 pub mod control;
 pub mod logging;
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, anyhow};
 use arc_swap::ArcSwap;
+use clap::Args;
+use tokio::net::TcpListener;
 use tokio::sync::Notify;
 use tracing::{debug, error, info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
@@ -22,16 +25,36 @@ use crate::agents::AgentManager;
 use crate::config::HostConfig;
 use crate::framing::{read_json_frame, write_json_frame};
 use crate::host;
+use crate::http_server::{HttpServerConfig, HttpServerState};
 use crate::ipc::{ControlListener, ControlStream};
 use crate::paths;
 use crate::state;
 
 use self::control::{Request, Response, RotateResult, StatusInfo, token_fingerprint};
 
+#[derive(Args, Debug, Clone)]
+pub struct ServeArgs {
+    /// Also serve the browser-native HTTP/WebSocket adapter.
+    #[arg(long)]
+    pub serve_pwa: bool,
+    /// HTTP/WebSocket bind address used with --serve-pwa.
+    #[arg(long, default_value = "127.0.0.1:5851")]
+    pub listen: SocketAddr,
+    /// Optional static bundle directory to serve alongside /api and /ws.
+    #[arg(long)]
+    pub pwa_dir: Option<PathBuf>,
+    /// Serve only /ws and skip /api/static routes.
+    #[arg(long)]
+    pub ws_only: bool,
+    /// Allow /api/pair on non-loopback listeners intended for Tailnet use.
+    #[arg(long)]
+    pub auto_pair_tailnet: bool,
+}
+
 /// Entry point for `alleycat serve`. Initializes file logging, acquires the
 /// single-instance lock, binds the iroh endpoint + control IPC, and runs
 /// until SIGTERM / SIGINT / control `Stop`.
-pub async fn run() -> anyhow::Result<()> {
+pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     let log_dir = paths::log_dir().context("locating log directory")?;
     let _log_guard: WorkerGuard =
         logging::init("info", &log_dir).context("initializing logging")?;
@@ -64,7 +87,6 @@ pub async fn run() -> anyhow::Result<()> {
     let node_id = secret_key.public().to_string();
     info!(node_id = %node_id, "loaded persistent identity");
 
-    let endpoint = host::bind_endpoint(secret_key.clone()).await?;
     let agents = AgentManager::new(Arc::clone(&config))
         .await
         .context("initializing agent manager")?;
@@ -72,6 +94,38 @@ pub async fn run() -> anyhow::Result<()> {
     let started_at = Instant::now();
     let shutdown = Arc::new(Notify::new());
 
+    let http_endpoint = args.serve_pwa.then_some(args.listen);
+    let http_task = if args.serve_pwa {
+        let listener = TcpListener::bind(args.listen)
+            .await
+            .with_context(|| format!("binding http adapter at {}", args.listen))?;
+        let server_config = HttpServerConfig {
+            listen: listener.local_addr()?,
+            bundle_dir: args.pwa_dir.clone(),
+            ws_only: args.ws_only,
+            auto_pair_tailnet: args.auto_pair_tailnet,
+        };
+        let state = HttpServerState {
+            config: Arc::clone(&config),
+            agents: agents.clone(),
+            secret_key: secret_key.clone(),
+            node_id: node_id.clone(),
+            started_at,
+            binary_version: crate::binary_version().to_string(),
+        };
+        let shutdown = Arc::clone(&shutdown);
+        Some(tokio::spawn(async move {
+            if let Err(error) =
+                crate::http_server::serve_http(listener, state, server_config, shutdown).await
+            {
+                error!("http adapter ended: {error:#}");
+            }
+        }))
+    } else {
+        None
+    };
+
+    let endpoint = host::bind_endpoint(secret_key.clone()).await?;
     let serve_task = {
         let endpoint = endpoint.clone();
         let agents = agents.clone();
@@ -96,6 +150,7 @@ pub async fn run() -> anyhow::Result<()> {
         endpoint: endpoint.clone(),
         node_id,
         started_at,
+        http_endpoint,
         shutdown: Arc::clone(&shutdown),
     });
 
@@ -113,6 +168,17 @@ pub async fn run() -> anyhow::Result<()> {
         Err(_) => {
             warn!("iroh shutdown did not complete within 5s; aborting");
             serve_abort.abort();
+        }
+    }
+
+    if let Some(http_task) = http_task {
+        let http_abort = http_task.abort_handle();
+        match tokio::time::timeout(std::time::Duration::from_secs(5), http_task).await {
+            Ok(_) => {}
+            Err(_) => {
+                warn!("http adapter shutdown did not complete within 5s; aborting");
+                http_abort.abort();
+            }
         }
     }
 
@@ -134,6 +200,7 @@ struct DaemonState {
     endpoint: iroh::Endpoint,
     node_id: String,
     started_at: Instant,
+    http_endpoint: Option<SocketAddr>,
     shutdown: Arc<Notify>,
 }
 
@@ -203,6 +270,7 @@ async fn handle_status(daemon: &DaemonState) -> Response {
         uptime_secs: daemon.started_at.elapsed().as_secs(),
         agents: daemon.agents.list_agents().await,
         version: Some(crate::binary_version().to_string()),
+        http_endpoint: daemon.http_endpoint.map(|addr| format!("http://{addr}")),
     };
     Response::ok_with(&info).unwrap_or_else(|e| Response::err(e.to_string()))
 }

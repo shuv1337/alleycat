@@ -150,98 +150,111 @@ impl AgentManager {
                 .with_context(|| format!("creating {}", home.display()))?;
         }
 
-        let pi_bin = resolve_pi_bin(&snapshot.agents.pi.bin)
-            .unwrap_or_else(|| PathBuf::from(snapshot.agents.pi.bin.clone()));
-        let mut pi_builder = PiBridge::builder()
-            .agent_bin(pi_bin)
-            .launcher(Arc::new(LocalLauncher));
-        if let Some(ref home) = codex_home {
-            pi_builder = pi_builder.codex_home(home.clone());
-        }
-        let pi_bridge = pi_builder.build().await.context("building pi bridge")?;
-
-        let mut amp_builder = AmpBridge::builder()
-            .agent_bin(snapshot.agents.amp.bin.clone())
-            .launcher(Arc::new(LocalLauncher))
-            .dangerously_allow_all(snapshot.agents.amp.dangerously_allow_all);
-        if let Some(ref home) = codex_home {
-            amp_builder = amp_builder.codex_home(home.clone());
-        }
-        let amp_bridge = amp_builder.build().await.context("building amp bridge")?;
-
-        let mut claude_builder = ClaudeBridge::builder()
-            .agent_bin(snapshot.agents.claude.bin.clone())
-            .launcher(Arc::new(LocalLauncher))
-            .bypass_permissions(snapshot.agents.claude.bypass_permissions);
-        if let Some(ref home) = codex_home {
-            claude_builder = claude_builder.codex_home(home.clone());
-        }
-        let claude_bridge = claude_builder
-            .build()
-            .await
-            .context("building claude bridge")?;
-
-        let mut droid_builder = DroidBridge::builder()
-            .agent_bin(snapshot.agents.droid.bin.clone())
-            .launcher(Arc::new(LocalLauncher));
-        if let Some(ref home) = codex_home {
-            droid_builder = droid_builder.codex_home(home.clone());
-        }
-        let droid_bridge = droid_builder
-            .build()
-            .await
-            .context("building droid bridge")?;
-
-        let devin_builder = AcpBridge::builder()
-            .agent_bin(snapshot.agents.devin.bin.clone())
-            .launcher(Arc::new(LocalLauncher));
-        let devin_acp = devin_builder
-            .build()
-            .await
-            .context("building devin bridge")?;
-        // Wrap the generic ACP bridge so `thread/list` reads devin's local
-        // SQLite store directly; ACP `session/list` filters out
-        // untitled/low-activity sessions and the mobile UI wants everything.
-        let devin_bridge: Arc<dyn Bridge> =
-            Arc::new(DevinBridge::with_default_db(devin_acp).context("wiring devin bridge")?);
-
-        // Grok is another ACP agent; launch via `grok agent stdio`
-        // (note: unlike Devin we do not assume a sessions.db for thread/list).
-        // All Grok launch knowledge lives in `grok-bridge`.
-        // The daemon and acp-bridge stay unaware of "agent", "stdio", etc.
-        let grok_bridge = GrokBridge::build(
-            snapshot.agents.grok.bin.clone(),
-            snapshot.agents.grok.no_leader,
-            snapshot.agents.grok.model.clone(),
-            snapshot.agents.grok.always_approve,
-            snapshot.agents.grok.reasoning_effort.clone(),
-            Arc::new(LocalLauncher),
-        )
-        .await
-        .context("building grok bridge")?;
-
         let mut bridges: HashMap<AgentKind, Arc<dyn Bridge>> = HashMap::new();
-        bridges.insert(AgentKind::Pi, pi_bridge as Arc<dyn Bridge>);
-        bridges.insert(AgentKind::Amp, amp_bridge as Arc<dyn Bridge>);
-        bridges.insert(AgentKind::Claude, claude_bridge as Arc<dyn Bridge>);
-        bridges.insert(AgentKind::Droid, droid_bridge as Arc<dyn Bridge>);
-        bridges.insert(AgentKind::Devin, devin_bridge);
-        bridges.insert(AgentKind::Grok, grok_bridge);
+        if snapshot.agents.pi.enabled {
+            let pi_bin = resolve_pi_bin(&snapshot.agents.pi.bin)
+                .unwrap_or_else(|| PathBuf::from(snapshot.agents.pi.bin.clone()));
+            let mut pi_builder = PiBridge::builder()
+                .agent_bin(pi_bin)
+                .launcher(Arc::new(LocalLauncher));
+            if let Some(ref home) = codex_home {
+                pi_builder = pi_builder.codex_home(home.clone());
+            }
+            let pi_bridge = pi_builder.build().await.context("building pi bridge")?;
+            bridges.insert(AgentKind::Pi, pi_bridge as Arc<dyn Bridge>);
+        }
 
-        let hermes_cfg = &snapshot.agents.hermes;
-        let hermes_bridge_cfg = HermesBridgeConfig {
-            mode: alleycat_hermes_bridge::HermesMode::Auto {
-                api_base: hermes_cfg.api_base.clone(),
-                bin: Some(hermes_cfg.bin.clone()),
-            },
-            state_dir: codex_home
-                .as_ref()
-                .map(|p| p.join("hermes-bridge").to_string_lossy().to_string()),
-        };
-        bridges.insert(
-            AgentKind::Hermes,
-            Arc::new(HermesBridge::new(hermes_bridge_cfg)) as Arc<dyn Bridge>,
-        );
+        if snapshot.agents.amp.enabled {
+            let mut amp_builder = AmpBridge::builder()
+                .agent_bin(snapshot.agents.amp.bin.clone())
+                .launcher(Arc::new(LocalLauncher))
+                .dangerously_allow_all(snapshot.agents.amp.dangerously_allow_all);
+            if let Some(ref home) = codex_home {
+                amp_builder = amp_builder.codex_home(home.clone());
+            }
+            let amp_bridge = amp_builder.build().await.context("building amp bridge")?;
+            bridges.insert(AgentKind::Amp, amp_bridge as Arc<dyn Bridge>);
+        }
+
+        if snapshot.agents.claude.enabled {
+            let mut claude_builder = ClaudeBridge::builder()
+                .agent_bin(snapshot.agents.claude.bin.clone())
+                .launcher(Arc::new(LocalLauncher))
+                .bypass_permissions(snapshot.agents.claude.bypass_permissions);
+            if let Some(ref home) = codex_home {
+                claude_builder = claude_builder.codex_home(home.clone());
+            }
+            let claude_bridge = claude_builder
+                .build()
+                .await
+                .context("building claude bridge")?;
+            bridges.insert(AgentKind::Claude, claude_bridge as Arc<dyn Bridge>);
+        }
+
+        if snapshot.agents.droid.enabled {
+            let mut droid_builder = DroidBridge::builder()
+                .agent_bin(snapshot.agents.droid.bin.clone())
+                .launcher(Arc::new(LocalLauncher));
+            if let Some(ref home) = codex_home {
+                droid_builder = droid_builder.codex_home(home.clone());
+            }
+            let droid_bridge = droid_builder
+                .build()
+                .await
+                .context("building droid bridge")?;
+            bridges.insert(AgentKind::Droid, droid_bridge as Arc<dyn Bridge>);
+        }
+
+        if snapshot.agents.devin.enabled {
+            let devin_builder = AcpBridge::builder()
+                .agent_bin(snapshot.agents.devin.bin.clone())
+                .launcher(Arc::new(LocalLauncher));
+            let devin_acp = devin_builder
+                .build()
+                .await
+                .context("building devin bridge")?;
+            // Wrap the generic ACP bridge so `thread/list` reads devin's local
+            // SQLite store directly; ACP `session/list` filters out
+            // untitled/low-activity sessions and the mobile UI wants everything.
+            let devin_bridge: Arc<dyn Bridge> =
+                Arc::new(DevinBridge::with_default_db(devin_acp).context("wiring devin bridge")?);
+            bridges.insert(AgentKind::Devin, devin_bridge);
+        }
+
+        if snapshot.agents.grok.enabled {
+            // Grok is another ACP agent; launch via `grok agent stdio`
+            // (note: unlike Devin we do not assume a sessions.db for thread/list).
+            // All Grok launch knowledge lives in `grok-bridge`.
+            // The daemon and acp-bridge stay unaware of "agent", "stdio", etc.
+            let grok_bridge = GrokBridge::build(
+                snapshot.agents.grok.bin.clone(),
+                snapshot.agents.grok.no_leader,
+                snapshot.agents.grok.model.clone(),
+                snapshot.agents.grok.always_approve,
+                snapshot.agents.grok.reasoning_effort.clone(),
+                Arc::new(LocalLauncher),
+            )
+            .await
+            .context("building grok bridge")?;
+            bridges.insert(AgentKind::Grok, grok_bridge);
+        }
+
+        if snapshot.agents.hermes.enabled {
+            let hermes_cfg = &snapshot.agents.hermes;
+            let hermes_bridge_cfg = HermesBridgeConfig {
+                mode: alleycat_hermes_bridge::HermesMode::Auto {
+                    api_base: hermes_cfg.api_base.clone(),
+                    bin: Some(hermes_cfg.bin.clone()),
+                },
+                state_dir: codex_home
+                    .as_ref()
+                    .map(|p| p.join("hermes-bridge").to_string_lossy().to_string()),
+            };
+            bridges.insert(
+                AgentKind::Hermes,
+                Arc::new(HermesBridge::new(hermes_bridge_cfg)) as Arc<dyn Bridge>,
+            );
+        }
 
         let session_cfg = &snapshot.session;
         let registry_config = SessionRegistryConfig {
@@ -380,6 +393,25 @@ impl AgentManager {
                     .await
             }
         }
+    }
+
+    /// Session-aware dispatch for browser WebSocket streams. Codex currently
+    /// stays on the native iroh stream path because its app-server proxy code
+    /// depends on iroh's bidirectional stream wrapper.
+    pub async fn serve_bridge_agent_with_session<S>(
+        &self,
+        agent: &str,
+        stream: S,
+        session: Arc<Session>,
+        last_seen: Option<u64>,
+    ) -> anyhow::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let kind = agent_kind_from_str(agent)
+            .ok_or_else(|| anyhow!("agent `{agent}` is not available over websocket"))?;
+        self.serve_with_session(kind, stream, session, last_seen)
+            .await
     }
 
     /// Polymorphic Bridge dispatch. Pi/Claude come straight from the eagerly-
