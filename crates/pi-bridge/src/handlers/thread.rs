@@ -349,7 +349,7 @@ pub async fn handle_thread_fork(
     };
     switch_handle_to(&handle, &source.metadata.pi_session_path).await?;
 
-    let entry_id = leaf_user_entry_id(&handle).await?;
+    let entry_id = fork_entry_id(&handle, params.additional.get("fromTurnId")).await?;
     let fork_resp = handle
         .send_request(pi::RpcCommand::Fork(pi::ForkCmd { id: None, entry_id }))
         .await
@@ -1120,7 +1120,10 @@ async fn switch_handle_to(
     Ok(())
 }
 
-async fn leaf_user_entry_id(handle: &Arc<PiProcessHandle>) -> Result<String, ThreadError> {
+async fn fork_entry_id(
+    handle: &Arc<PiProcessHandle>,
+    from_turn_id: Option<&serde_json::Value>,
+) -> Result<String, ThreadError> {
     let resp = handle
         .send_request(pi::RpcCommand::GetForkMessages(pi::BareCmd::default()))
         .await
@@ -1136,12 +1139,31 @@ async fn leaf_user_entry_id(handle: &Arc<PiProcessHandle>) -> Result<String, Thr
             .ok_or_else(|| ThreadError::PiRpc("missing fork_messages data".into()))?,
     )
     .map_err(|e| ThreadError::PiRpc(format!("decode fork_messages: {e}")))?;
+    if let Some(from_turn_id) = from_turn_id.and_then(|value| value.as_str()) {
+        let index = parse_turn_index(from_turn_id).ok_or_else(|| {
+            ThreadError::InvalidParams(format!("invalid fromTurnId: {from_turn_id}"))
+        })?;
+        return data
+            .messages
+            .get(index)
+            .map(|m| m.entry_id.clone())
+            .ok_or_else(|| {
+                ThreadError::InvalidParams(format!(
+                    "thread has {} user messages; cannot fork from {from_turn_id}",
+                    data.messages.len()
+                ))
+            });
+    }
     data.messages
         .last()
         .map(|m| m.entry_id.clone())
         .ok_or_else(|| {
             ThreadError::InvalidParams("source thread has no user messages to fork from".into())
         })
+}
+
+fn parse_turn_index(turn_id: &str) -> Option<usize> {
+    turn_id.strip_prefix("turn_")?.parse().ok()
 }
 
 async fn fetch_turns(handle: &Arc<PiProcessHandle>) -> Result<Vec<p::Turn>, ThreadError> {
