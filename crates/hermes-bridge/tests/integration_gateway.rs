@@ -51,9 +51,9 @@ fn attach_and_drain(
     (rx, handle)
 }
 
-async fn drain_until<F: Fn(&Value) -> bool>(
+async fn drain_until<F: FnMut(&Value) -> bool>(
     rx: &mut mpsc::UnboundedReceiver<Value>,
-    pred: F,
+    mut pred: F,
     max: Duration,
 ) -> Option<Value> {
     let deadline = tokio::time::Instant::now() + max;
@@ -584,6 +584,43 @@ async fn approval_request_bridges_to_client() {
     );
     gw.abort();
     drainer.abort();
+}
+
+#[tokio::test]
+async fn never_policy_auto_approves_without_client_prompt() {
+    let (api_base, state, gw) = spawn_fake_gateway(Scenario::NeedsApproval).await;
+    let dir = TempDir::new().unwrap();
+    let bridge = make_bridge(dir.path().to_path_buf(), api_base);
+    let (session, ctx) = make_conn();
+    let (mut rx, _drainer) = attach_and_drain(&session);
+
+    let thread_id = start_thread(&bridge, &ctx, "/tmp").await;
+    start_turn(&bridge, &ctx, &thread_id, "hi", AskForApproval::Never).await;
+
+    let mut saw_prompt = false;
+    let completed = drain_until(
+        &mut rx,
+        |f| {
+            if frame_method(f) == Some("hermes/approvalRequest") {
+                saw_prompt = true;
+            }
+            frame_method(f) == Some("turn/completed")
+        },
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("turn/completed must arrive");
+    let payload: TurnCompletedNotification =
+        serde_json::from_value(completed.get("params").cloned().unwrap()).unwrap();
+    assert_eq!(payload.turn.status, TurnStatus::Completed);
+    assert!(!saw_prompt, "approval_policy=Never must not prompt client");
+    let approvals = state.approvals.lock().unwrap().clone();
+    assert_eq!(
+        approvals,
+        vec!["once".to_string()],
+        "auto-approval should submit exactly one once decision"
+    );
+    gw.abort();
 }
 
 #[tokio::test]

@@ -437,6 +437,33 @@ impl HermesRunManager {
             return TranslationOutcome::TerminalError { message };
         }
         if event.event == "approval.request" {
+            if auto_approve_once {
+                if let Err(err) = self
+                    .client
+                    .resolve_run_approval(run_id, crate::api_client::ApprovalChoice::Once, false)
+                    .await
+                {
+                    return TranslationOutcome::TerminalError {
+                        message: format!("Hermes approval error: {err}"),
+                    };
+                }
+                self.persist_and_publish(
+                    run_id,
+                    turn_id,
+                    thread_id,
+                    "hermes/approvalResponded",
+                    json!({
+                        "thread_id": thread_id,
+                        "turn_id": turn_id,
+                        "run_id": run_id,
+                        "data": {
+                            "choice": "once",
+                            "autoApproved": true
+                        },
+                    }),
+                );
+                return TranslationOutcome::Continue;
+            }
             // Publish a normalized approval event so a connection-level
             // translator can prompt the client through `notifier().request`.
             // The manager is back-end-agnostic: it only knows the gateway
@@ -454,20 +481,6 @@ impl HermesRunManager {
                     "data": event.data,
                 }),
             );
-            // If no client has wired up an approval listener and the policy
-            // calls for auto-approval, post `once` directly. This preserves
-            // current `approval_policy=Never` behavior pending Phase 6 wire-up.
-            if auto_approve_once {
-                if let Err(err) = self
-                    .client
-                    .resolve_run_approval(run_id, crate::api_client::ApprovalChoice::Once, false)
-                    .await
-                {
-                    return TranslationOutcome::TerminalError {
-                        message: format!("Hermes approval error: {err}"),
-                    };
-                }
-            }
             return TranslationOutcome::Continue;
         }
         if event.event == "approval.responded" {
