@@ -43,8 +43,33 @@ fn test_acp_to_codex_initialize_result() {
     assert!(codex_result.is_ok());
 
     let codex_result = codex_result.unwrap();
-    assert_eq!(codex_result["serverInfo"]["name"], "TestAgent");
-    assert_eq!(codex_result["serverInfo"]["version"], "2.0.0");
+    // Upstream rewrote the output shape (see acp-bridge/src/translate.rs in
+    // dnakov 4e42351): instead of `{ capabilities, serverInfo }`, the result
+    // is now `{ userAgent, codexHome, platformFamily, platformOs }`. The
+    // agent name+version are baked into the `userAgent` string.
+    let user_agent = codex_result["userAgent"].as_str().expect("userAgent");
+    assert!(
+        user_agent.starts_with("alleycat-acp-bridge/"),
+        "userAgent prefix: {user_agent}"
+    );
+    assert!(
+        user_agent.contains("(TestAgent 2.0.0)"),
+        "userAgent must embed agent name and version: {user_agent}"
+    );
+    assert!(
+        codex_result["codexHome"].as_str().is_some(),
+        "codexHome must be a string"
+    );
+    assert_eq!(
+        codex_result["platformFamily"],
+        std::env::consts::FAMILY,
+        "platformFamily mirrors std::env::consts::FAMILY"
+    );
+    assert_eq!(
+        codex_result["platformOs"],
+        std::env::consts::OS,
+        "platformOs mirrors std::env::consts::OS"
+    );
 }
 
 #[test]

@@ -30,23 +30,27 @@ async fn two_threads_in_different_cwds_remain_separate() {
                 "time":{"created":1_000,"updated":1_000}
             }),
         );
+        // Upstream dropped the `directory=` query on `GET /session` (see
+        // opencode-bridge handlers/mod.rs ~line 465). The bridge now fetches
+        // the full list and filters locally on cwd, so we register a single
+        // bare-list route that returns BOTH sessions; the bridge is expected
+        // to narrow them per request.
         guard.route(
-            "GET /session?directory=%2Ftmp%2Fa",
-            json!([{
-                "id":"ses_a",
-                "directory":"/tmp/a",
-                "title":"V2-A",
-                "time":{"created":1_000,"updated":1_000}
-            }]),
-        );
-        guard.route(
-            "GET /session?directory=%2Ftmp%2Fb",
-            json!([{
-                "id":"ses_b",
-                "directory":"/tmp/b",
-                "title":"V2-B",
-                "time":{"created":1_001,"updated":1_001}
-            }]),
+            "GET /session?",
+            json!([
+                {
+                    "id":"ses_a",
+                    "directory":"/tmp/a",
+                    "title":"V2-A",
+                    "time":{"created":1_000,"updated":1_000}
+                },
+                {
+                    "id":"ses_b",
+                    "directory":"/tmp/b",
+                    "title":"V2-B",
+                    "time":{"created":1_001,"updated":1_001}
+                }
+            ]),
         );
     }
 
@@ -123,18 +127,19 @@ async fn two_threads_in_different_cwds_remain_separate() {
     assert_eq!(data_b[0]["id"].as_str(), Some(thread_b.as_str()));
     assert_eq!(data_b[0]["cwd"], "/tmp/b");
 
-    // Confirm the bridge actually filtered at the upstream level (not just
-    // post-filtered locally) by inspecting the captured request paths.
+    // Inverted from the original assertion: upstream no longer sends
+    // `directory=` on `GET /session`. Verify the bridge fetched the bare
+    // list and did the cwd narrowing locally.
     let seen = fx.seen();
     assert!(
         seen.iter()
-            .any(|line| line.contains("GET /session?directory=%2Ftmp%2Fa")),
-        "expected /tmp/a directory filter on upstream GET /session: {seen:?}"
+            .any(|line| line.starts_with("GET /session?")
+                || line.starts_with("GET /session HTTP")),
+        "expected bare `GET /session` request on upstream: {seen:?}"
     );
     assert!(
-        seen.iter()
-            .any(|line| line.contains("GET /session?directory=%2Ftmp%2Fb")),
-        "expected /tmp/b directory filter on upstream GET /session: {seen:?}"
+        !seen.iter().any(|line| line.contains("directory=")),
+        "bridge must not send `directory=` query on GET /session anymore: {seen:?}"
     );
 
     // Drain any queued response bodies just to keep the mutex's `bodies` map
