@@ -47,8 +47,11 @@ async fn model_list_reads_object_catalog_from_config_providers() {
     let data = resp["result"]["data"].as_array().expect("data");
     assert_eq!(data.len(), 1, "{data:#?}");
     assert_eq!(data[0]["id"], "lmstudio/qwen/qwen3.5-35b-a3b");
-    assert_eq!(data[0]["model"], "qwen/qwen3.5-35b-a3b");
-    assert_eq!(data[0]["displayName"], "Qwen 3.5 35B");
+    assert_eq!(data[0]["model"], "lmstudio/qwen/qwen3.5-35b-a3b");
+    assert_eq!(
+        data[0]["displayName"],
+        "OpenCode / LM Studio / Qwen 3.5 35B"
+    );
     assert_eq!(data[0]["description"], "Local model");
     assert_eq!(data[0]["inputModalities"], json!(["text", "image"]));
     assert_eq!(data[0]["isDefault"], true);
@@ -97,7 +100,8 @@ async fn model_list_falls_back_to_provider_object_catalog() {
     let data = resp["result"]["data"].as_array().expect("data");
     assert_eq!(data.len(), 1, "{data:#?}");
     assert_eq!(data[0]["id"], "opencode/big-pickle");
-    assert_eq!(data[0]["displayName"], "Big Pickle");
+    assert_eq!(data[0]["model"], "opencode/big-pickle");
+    assert_eq!(data[0]["displayName"], "OpenCode / OpenCode / Big Pickle");
     assert_eq!(data[0]["inputModalities"], json!(["text"]));
     assert_eq!(data[0]["isDefault"], true);
     assert_eq!(

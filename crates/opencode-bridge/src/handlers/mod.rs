@@ -1152,6 +1152,11 @@ fn flatten_models(providers: Value) -> Vec<Value> {
                 .and_then(Value::as_str)
                 .unwrap_or("opencode")
                 .to_string();
+            let provider_name = provider
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or(&provider_id)
+                .to_string();
             let defaults = defaults.clone();
             models_for_provider(provider)
                 .into_iter()
@@ -1159,7 +1164,7 @@ fn flatten_models(providers: Value) -> Vec<Value> {
                     let is_default = defaults
                         .iter()
                         .any(|(p, m)| p == &provider_id && m == &model_id);
-                    model_entry(&provider_id, &model_id, &model, is_default)
+                    model_entry(&provider_id, &provider_name, &model_id, &model, is_default)
                 })
         })
         .collect();
@@ -1218,11 +1223,22 @@ fn models_for_provider(provider: Value) -> Vec<(String, Value)> {
     }
 }
 
-fn model_entry(provider_id: &str, model_id: &str, model: &Value, is_default: bool) -> Value {
+fn model_entry(
+    provider_id: &str,
+    provider_name: &str,
+    model_id: &str,
+    model: &Value,
+    is_default: bool,
+) -> Value {
+    let full_model_id = format!("{provider_id}/{model_id}");
+    let display_name = model
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or(model_id);
     json!({
-        "id": format!("{provider_id}/{model_id}"),
-        "model": model_id,
-        "displayName": model.get("name").and_then(Value::as_str).unwrap_or(model_id),
+        "id": full_model_id,
+        "model": full_model_id,
+        "displayName": format!("OpenCode / {provider_name} / {display_name}"),
         "description": model.get("description").and_then(Value::as_str).unwrap_or(""),
         "hidden": false,
         "supportedReasoningEfforts": reasoning_efforts_for_model(model),
