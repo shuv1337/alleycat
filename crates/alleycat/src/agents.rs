@@ -18,6 +18,7 @@ use alleycat_grok_bridge::GrokBridge;
 use alleycat_hermes_bridge::{HermesBridge, HermesBridgeConfig};
 use alleycat_opencode_bridge::OpencodeBridge;
 use alleycat_pi_bridge::PiBridge;
+use alleycat_shell_bridge::ShellBridge;
 use anyhow::{Context, anyhow};
 use arc_swap::ArcSwap;
 use futures::{SinkExt, StreamExt};
@@ -50,6 +51,7 @@ pub enum AgentKind {
     Hermes,
     Devin,
     Grok,
+    Shell,
 }
 
 /// How the daemon talks to `codex app-server`. Selected at startup by probing
@@ -225,6 +227,15 @@ impl AgentManager {
         .await
         .context("building grok bridge")?;
 
+        let shell_cfg = &snapshot.agents.shell;
+        let mut shell_builder = ShellBridge::builder()
+            .shell_bin(shell_cfg.shell_bin.clone())
+            .allow_env_passthrough(shell_cfg.allow_env_passthrough);
+        if let Some(default_cwd) = shell_cfg.default_cwd.as_ref() {
+            shell_builder = shell_builder.default_cwd(default_cwd);
+        }
+        let shell_bridge = shell_builder.build();
+
         let mut bridges: HashMap<AgentKind, Arc<dyn Bridge>> = HashMap::new();
         bridges.insert(AgentKind::Pi, pi_bridge as Arc<dyn Bridge>);
         bridges.insert(AgentKind::Amp, amp_bridge as Arc<dyn Bridge>);
@@ -232,6 +243,7 @@ impl AgentManager {
         bridges.insert(AgentKind::Droid, droid_bridge as Arc<dyn Bridge>);
         bridges.insert(AgentKind::Devin, devin_bridge);
         bridges.insert(AgentKind::Grok, grok_bridge);
+        bridges.insert(AgentKind::Shell, shell_bridge);
 
         let hermes_cfg = &snapshot.agents.hermes;
         let hermes_mode = match hermes_cfg.mode {
@@ -602,6 +614,7 @@ impl AgentManager {
                 "hermes" => self.hermes_available().await,
                 "devin" => self.devin_available(),
                 "grok" => self.grok_available(),
+                "shell" => self.shell_available(),
                 _ => false,
             };
             let wire = if manifest.name == "codex" {
@@ -710,6 +723,7 @@ impl AgentManager {
             "hermes" => Some("hermes"),
             "devin" => Some("devin"),
             "grok" => Some("grok"),
+            "shell" => Some("shell"),
             _ => None,
         }
     }
@@ -726,6 +740,7 @@ impl AgentManager {
             "hermes" => cfg.agents.hermes.enabled,
             "devin" => cfg.agents.devin.enabled,
             "grok" => cfg.agents.grok.enabled,
+            "shell" => cfg.agents.shell.enabled,
             _ => false,
         }
     }
@@ -1289,6 +1304,11 @@ impl AgentManager {
         cfg.agents.grok.enabled && which::which(&cfg.agents.grok.bin).is_ok()
     }
 
+    fn shell_available(&self) -> bool {
+        let cfg = self.config.load();
+        cfg.agents.shell.enabled && which::which(&cfg.agents.shell.shell_bin).is_ok()
+    }
+
     async fn hermes_available(&self) -> bool {
         let (enabled, mode, bin, api_base, timeout_ms) = {
             let cfg = self.config.load();
@@ -1776,6 +1796,7 @@ fn agent_kind_from_str(name: &str) -> Option<AgentKind> {
         "hermes" => Some(AgentKind::Hermes),
         "devin" => Some(AgentKind::Devin),
         "grok" => Some(AgentKind::Grok),
+        "shell" => Some(AgentKind::Shell),
         _ => None,
     }
 }
@@ -1790,6 +1811,7 @@ fn agent_kind_str(kind: AgentKind) -> &'static str {
         AgentKind::Hermes => "hermes",
         AgentKind::Devin => "devin",
         AgentKind::Grok => "grok",
+        AgentKind::Shell => "shell",
     }
 }
 
@@ -1804,6 +1826,7 @@ impl crate::config::AgentsConfig {
             AgentKind::Hermes => self.hermes.enabled,
             AgentKind::Devin => self.devin.enabled,
             AgentKind::Grok => self.grok.enabled,
+            AgentKind::Shell => self.shell.enabled,
         }
     }
 }
