@@ -321,6 +321,7 @@ async fn serve_connected_ws(
 struct WebSocketBinaryStream {
     websocket: WebSocketStream<TcpStream>,
     read_buf: Vec<u8>,
+    write_buf: Vec<u8>,
 }
 
 impl WebSocketBinaryStream {
@@ -328,6 +329,7 @@ impl WebSocketBinaryStream {
         Self {
             websocket,
             read_buf: Vec::new(),
+            write_buf: Vec::new(),
         }
     }
 }
@@ -355,7 +357,12 @@ impl AsyncRead for WebSocketBinaryStream {
                             "websocket binary frame too large",
                         )));
                     }
-                    self.read_buf.extend_from_slice(&bytes);
+                    let body = match decode_ws_binary_frame(&bytes) {
+                        Ok(body) => body,
+                        Err(error) => return Poll::Ready(Err(error)),
+                    };
+                    self.read_buf.extend_from_slice(body);
+                    self.read_buf.push(b'\n');
                 }
                 Poll::Ready(Some(Ok(Message::Close(_)))) | Poll::Ready(None) => {
                     return Poll::Ready(Ok(()));
@@ -385,20 +392,63 @@ impl AsyncWrite for WebSocketBinaryStream {
         cx: &mut TaskContext<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        match Pin::new(&mut self.websocket).poll_ready(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(error)) => Poll::Ready(Err(std::io::Error::other(error))),
-            Poll::Ready(Ok(())) => {
-                let message = Message::Binary(buf.to_vec().into());
-                if let Err(error) = Pin::new(&mut self.websocket).start_send(message) {
-                    return Poll::Ready(Err(std::io::Error::other(error)));
+        self.write_buf.extend_from_slice(buf);
+        loop {
+            let Some(newline) = self.write_buf.iter().position(|byte| *byte == b'\n') else {
+                return Poll::Ready(Ok(buf.len()));
+            };
+            let mut line = self.write_buf.drain(..=newline).collect::<Vec<u8>>();
+            if line.last() == Some(&b'\n') {
+                line.pop();
+            }
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            if line.is_empty() {
+                continue;
+            }
+
+            match Pin::new(&mut self.websocket).poll_ready(cx) {
+                Poll::Pending => {
+                    self.write_buf
+                        .splice(0..0, line.into_iter().chain(std::iter::once(b'\n')));
+                    return Poll::Pending;
                 }
-                Poll::Ready(Ok(buf.len()))
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(std::io::Error::other(error))),
+                Poll::Ready(Ok(())) => {
+                    let frame = match encode_ws_binary_frame(&line) {
+                        Ok(frame) => frame,
+                        Err(error) => return Poll::Ready(Err(error)),
+                    };
+                    if let Err(error) =
+                        Pin::new(&mut self.websocket).start_send(Message::Binary(frame.into()))
+                    {
+                        return Poll::Ready(Err(std::io::Error::other(error)));
+                    }
+                }
             }
         }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        if !self.write_buf.is_empty() {
+            match Pin::new(&mut self.websocket).poll_ready(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(std::io::Error::other(error))),
+                Poll::Ready(Ok(())) => {
+                    let line = std::mem::take(&mut self.write_buf);
+                    let frame = match encode_ws_binary_frame(line.trim_ascii_end()) {
+                        Ok(frame) => frame,
+                        Err(error) => return Poll::Ready(Err(error)),
+                    };
+                    if let Err(error) =
+                        Pin::new(&mut self.websocket).start_send(Message::Binary(frame.into()))
+                    {
+                        return Poll::Ready(Err(std::io::Error::other(error)));
+                    }
+                }
+            }
+        }
         Pin::new(&mut self.websocket)
             .poll_flush(cx)
             .map_err(std::io::Error::other)
@@ -412,6 +462,36 @@ impl AsyncWrite for WebSocketBinaryStream {
             .poll_close(cx)
             .map_err(std::io::Error::other)
     }
+}
+
+fn decode_ws_binary_frame(bytes: &[u8]) -> std::io::Result<&[u8]> {
+    if bytes.len() < 4 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "websocket frame missing length prefix",
+        ));
+    }
+    let len = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    if len > MAX_FRAME_BYTES || bytes.len() != len + 4 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "websocket frame length mismatch",
+        ));
+    }
+    Ok(&bytes[4..])
+}
+
+fn encode_ws_binary_frame(body: &[u8]) -> std::io::Result<Vec<u8>> {
+    if body.len() > MAX_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "websocket frame too large",
+        ));
+    }
+    let mut frame = Vec::with_capacity(body.len() + 4);
+    frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    frame.extend_from_slice(body);
+    Ok(frame)
 }
 
 async fn status_info(
