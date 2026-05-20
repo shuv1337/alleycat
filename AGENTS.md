@@ -30,6 +30,29 @@ Alleycat is a Rust workspace for an Iroh-backed daemon that multiplexes local co
 - OpenCode is lazily spawned by Alleycat with `opencode serve --port=<auto>` on first paired connection; local standalone `opencode serve` should not be left running unless intentionally testing outside Alleycat.
 - The daemon spawns external CLIs on demand; availability is environment-dependent.
 
+## Parallel local alleycat instances
+
+Two distinct alleycat repos run on this machine simultaneously under the same binary name. Always disambiguate before restarting, killing, installing, or editing — they share zero state but share the binary name and several conventions.
+
+| Fact | This repo (shuv1337 fork) | Sibling (dnakov upstream) |
+|---|---|---|
+| Repo path | `/home/shuv/repos/alleycat` | `/home/shuv/repos/alleycat-fork` |
+| Remote | `git@github.com:shuv1337/alleycat.git` (origin), `dnakov/alleycat` (upstream) | `git@github.com:dnakov/alleycat.git` (origin) |
+| Binary in use | `~/.cargo/bin/alleycat` (release, `cargo install`ed from this tree) | `target/debug/alleycat` (in-tree debug build) |
+| Launch | systemd user unit `alleycat.service` | tmux session `alleycat-pwa` on socket `/tmp/tmux-skill-sockets/litter-pwa-alleycat.sock`, window `serve` |
+| Ports | `127.0.0.1:8390` (codex bridge), `127.0.0.1:8391` (provider router) | `127.0.0.1:5851` (`--serve-pwa --pwa-dir .../litter-pwa/apps/web/dist`) |
+| `HOME` / state | `~`, `~/.config/alleycat/`, `~/.local/state/alleycat/` | `/tmp/litter-pwa-alleycat-home/{,.config,.local/state,.run}` (isolated `XDG_CONFIG_HOME`/`XDG_STATE_HOME`/`XDG_RUNTIME_DIR`) |
+| Identify by cgroup | `/user.slice/.../app.slice/alleycat.service` | none (parent is the tmux server PID) |
+| Unique CLI flags | `serve` (default) | `--serve-pwa` and `--pwa-dir` — upstream-only, do **not** exist in this fork |
+
+Rules:
+
+- **Never `pkill alleycat` or blanket-kill by name** — it hits both. Disambiguate by cgroup, `HOME` env (`tr '\0' '\n' < /proc/<pid>/environ | grep HOME`), `cwd`, or unique flags.
+- `systemctl --user restart alleycat.service` restarts only `~/.cargo/bin/alleycat`. That binary is built from **this** repo. Running it from the upstream tree restarts the wrong source.
+- `cargo install --locked --path crates/alleycat` from **either** tree overwrites `~/.cargo/bin/alleycat` and silently hijacks the systemd binary. The upstream sibling is meant to run from `target/debug/`, not installed — don't `cargo install` from there.
+- The sibling holds its own iroh node, relay connection, and `QADv6 NetworkUnreachable` IPv6 warning stream in its own log dir. The noisy warnings are not cross-talk.
+- Sibling control socket lives at `/tmp/litter-pwa-alleycat-home/.run/alleycat-<hash>/control.sock` — not `~/.local/state/alleycat/...`. Running `alleycat status` against the sibling requires `HOME=/tmp/litter-pwa-alleycat-home alleycat status`.
+
 ## Hermes bridge
 
 - Configured under `[agents.hermes]` in the daemon TOML config:
