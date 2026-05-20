@@ -13,7 +13,7 @@ use alleycat_bridge_core::session::Session;
 use alleycat_bridge_core::{Bridge, Conn};
 use alleycat_codex_proto::common::{AskForApproval, TurnStatus};
 use alleycat_codex_proto::notifications::{ItemStartedNotification, TurnCompletedNotification};
-use alleycat_codex_proto::thread::{ThreadReadParams, ThreadStartParams};
+use alleycat_codex_proto::thread::{ThreadReadParams, ThreadResumeParams, ThreadStartParams};
 use alleycat_codex_proto::turn::TurnStartParams;
 use alleycat_hermes_bridge::{HermesBridge, HermesBridgeConfig, HermesMode};
 use serde_json::{Value, json};
@@ -88,6 +88,9 @@ enum Scenario {
     NeedsApproval,
     /// Stream `run.failed` with a message.
     Failure,
+    /// Stream one delta, pause, then finish so a second connection can resume
+    /// and subscribe while the run is still active.
+    SlowResume,
     /// Stream a delta then a terminal event in a chunk that is NOT followed
     /// by the standard `\n\n` separator (regression for Phase 1.5 fix).
     TerminalInTrailingChunk,
@@ -297,6 +300,12 @@ async fn write_sse(
             sse_send(socket, "message.delta", "{\"delta\":\"oops\"}").await;
             sse_send(socket, "run.failed", "{\"message\":\"boom\"}").await;
         }
+        Scenario::SlowResume => {
+            sse_send(socket, "message.delta", "{\"delta\":\"first\"}").await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            sse_send(socket, "message.delta", "{\"delta\":\"second\"}").await;
+            sse_send(socket, "run.completed", "{\"output\":\"firstsecond\"}").await;
+        }
         Scenario::TerminalInTrailingChunk => {
             // Emit a delta normally, then a terminal event WITHOUT the final
             // `\n\n`. The bridge's SSE parser should still split it because
@@ -364,6 +373,17 @@ async fn start_turn(
         .expect("turn/start");
 }
 
+async fn resume_thread(bridge: &HermesBridge, ctx: &Conn, thread_id: &str) {
+    let params = ThreadResumeParams {
+        thread_id: thread_id.into(),
+        ..Default::default()
+    };
+    bridge
+        .dispatch(ctx, "thread/resume", serde_json::to_value(&params).unwrap())
+        .await
+        .expect("thread/resume");
+}
+
 // ---- tests ----
 
 #[tokio::test]
@@ -388,6 +408,41 @@ async fn happy_path_streams_and_finalizes() {
         serde_json::from_value(completed.get("params").cloned().unwrap()).unwrap();
     assert_eq!(payload.turn.status, TurnStatus::Completed);
 
+    gw.abort();
+}
+
+#[tokio::test]
+async fn resume_subscribes_to_active_run() {
+    let (api_base, _state, gw) = spawn_fake_gateway(Scenario::SlowResume).await;
+    let dir = TempDir::new().unwrap();
+    let bridge = make_bridge(dir.path().to_path_buf(), api_base);
+    let (session, ctx) = make_conn();
+    let (mut rx1, _drainer1) = attach_and_drain(&session);
+
+    let thread_id = start_thread(&bridge, &ctx, "/tmp").await;
+    start_turn(&bridge, &ctx, &thread_id, "hi", AskForApproval::Never).await;
+    drain_until(
+        &mut rx1,
+        |f| frame_method(f) == Some("item/agentMessage/delta"),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("first delta must arrive before resume");
+
+    let ctx2 = Conn::from_session(Arc::clone(&session));
+    let (mut rx2, _drainer2) = attach_and_drain(&session);
+    resume_thread(&bridge, &ctx2, &thread_id).await;
+
+    let completed = drain_until(
+        &mut rx2,
+        |f| frame_method(f) == Some("turn/completed"),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("resumed connection must receive active run completion");
+    let payload: TurnCompletedNotification =
+        serde_json::from_value(completed.get("params").cloned().unwrap()).unwrap();
+    assert_eq!(payload.turn.status, TurnStatus::Completed);
     gw.abort();
 }
 
@@ -578,6 +633,17 @@ async fn thread_read_recovers_turns_from_persistence_after_drop() {
         .and_then(Value::as_str)
         .unwrap();
     assert_eq!(last_status, "completed");
+    let last_items = turns
+        .last()
+        .and_then(|t| t.get("items"))
+        .and_then(Value::as_array)
+        .unwrap();
+    assert!(
+        last_items
+            .iter()
+            .any(|item| item.get("type").and_then(Value::as_str) == Some("userMessage")),
+        "post-restart thread/read should preserve the user message item"
+    );
     gw.abort();
 }
 

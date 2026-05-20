@@ -365,7 +365,7 @@ fn turn_from_run_record(record: &HermesRunRecord, event_store: &EventStore) -> T
         HermesTurnStatus::Starting | HermesTurnStatus::Running => TurnStatus::InProgress,
         HermesTurnStatus::Unknown => TurnStatus::Failed,
     };
-    let mut items: Vec<ThreadItem> = Vec::new();
+    let mut items: Vec<ThreadItem> = record.user_items.clone();
     if let Some(run_id) = record.run_id.as_deref() {
         if let Ok(events) = event_store.read_all(run_id) {
             for ev in events {
@@ -549,6 +549,7 @@ impl HermesBridge {
         if !p.exclude_turns {
             thread.turns = self.logged_turns(&p.thread_id);
         }
+        self.subscribe_active_run(ctx, &binding.thread_id);
         let _ = ctx.notifier().send_notification(
             "thread/started",
             ThreadStartedNotification {
@@ -556,6 +557,25 @@ impl HermesBridge {
             },
         );
         to_value(Self::start_like_response(thread, p.model.or(binding.model)))
+    }
+
+    fn subscribe_active_run(&self, ctx: &Conn, thread_id: &str) {
+        let Some(record) = self.run_store.active_for_thread(thread_id) else {
+            return;
+        };
+        if !matches!(
+            record.status,
+            HermesTurnStatus::Starting | HermesTurnStatus::Running
+        ) {
+            return;
+        }
+        let Some(run_id) = record.run_id.as_deref() else {
+            return;
+        };
+        if !self.run_manager.is_active(run_id) {
+            return;
+        }
+        self.spawn_translator(ctx.clone(), run_id.to_string(), 0);
     }
 
     async fn handle_thread_fork(&self, ctx: &Conn, params: Value) -> Result<Value, JsonRpcError> {
@@ -808,7 +828,8 @@ impl HermesBridge {
                 turn,
             },
         );
-        self.emit_user_message(ctx, &thread_id, &turn_id, &p.input)
+        let user_items = self
+            .emit_user_message(ctx, &thread_id, &turn_id, &p.input)
             .await;
         let text = user_text(&p.input);
         let cwd = p.cwd.as_ref().map(|p| p.to_string_lossy().to_string());
@@ -840,6 +861,7 @@ impl HermesBridge {
             accumulated_text: String::new(),
             last_event_seq: None,
             agent_item_id: Some(agent_item_id.clone()),
+            user_items,
         };
         if let Err(err) = self.run_store.upsert(starting_record) {
             tracing::warn!(error = %err, turn_id = %turn_id, "persist starting run record failed");
@@ -1306,6 +1328,7 @@ impl HermesBridge {
                     accumulated_text: String::new(),
                     last_event_seq: None,
                     agent_item_id: Some(agent_item_id.to_string()),
+                    user_items: Vec::new(),
                 }
             }
             Err(err) => {
@@ -1323,6 +1346,7 @@ impl HermesBridge {
                     accumulated_text: String::new(),
                     last_event_seq: None,
                     agent_item_id: Some(agent_item_id.to_string()),
+                    user_items: Vec::new(),
                 }
             }
         };
@@ -1446,12 +1470,13 @@ impl HermesBridge {
         thread_id: &str,
         turn_id: &str,
         input: &[UserInput],
-    ) {
+    ) -> Vec<ThreadItem> {
         let item_id = format!("item_{}", random_hex(8));
         let item = ThreadItem::UserMessage {
             id: item_id,
             content: input.to_vec(),
         };
+        let persisted_item = item.clone();
         self.push_logged_item(thread_id, turn_id, item.clone());
         let _ = ctx.notifier().send_notification(
             "item/started",
@@ -1471,6 +1496,7 @@ impl HermesBridge {
                 parent_item_id: None,
             },
         );
+        vec![persisted_item]
     }
 
     async fn emit_agent_started(&self, ctx: &Conn, thread_id: &str, turn_id: &str, item_id: &str) {

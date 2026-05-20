@@ -69,6 +69,9 @@ pub struct HermesRunRecord {
     /// id as the original turn.
     #[serde(default)]
     pub agent_item_id: Option<String>,
+    /// User-authored input items for durable post-restart turn reconstruction.
+    #[serde(default)]
+    pub user_items: Vec<alleycat_codex_proto::items::ThreadItem>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -332,6 +335,7 @@ mod tests {
             accumulated_text: String::new(),
             last_event_seq: None,
             agent_item_id: None,
+            user_items: Vec::new(),
         }
     }
 
