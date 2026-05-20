@@ -19,12 +19,12 @@ use alleycat_pi_bridge::PiBridge;
 use anyhow::{Context, anyhow};
 use arc_swap::ArcSwap;
 use serde::Deserialize;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::net::UnixStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::{Mutex, Notify, OnceCell};
 use tracing::{info, warn};
 
 use crate::agent_manifest::{MANIFESTS, manifest_for};
@@ -309,6 +309,75 @@ impl AgentManager {
         &self.session_registry
     }
 
+    /// Local loopback entrypoint for desktop clients that speak Codex's
+    /// websocket app-server wire directly. For modern Codex builds Alleycat
+    /// owns a Unix app-server child and bridges each accepted TCP client through
+    /// `codex app-server proxy`; for older websocket-only builds it starts the
+    /// shared Codex websocket process on the configured host/port.
+    pub async fn serve_codex_local_tcp_bridge(&self, shutdown: Arc<Notify>) -> anyhow::Result<()> {
+        let (enabled, host, port) = {
+            let cfg = self.config.load();
+            (
+                cfg.agents.codex.enabled,
+                cfg.agents.codex.host.clone(),
+                cfg.agents.codex.port,
+            )
+        };
+        if !enabled {
+            return Ok(());
+        }
+
+        match self.codex_mode {
+            CodexMode::Stdio => {
+                warn!(
+                    %host,
+                    port,
+                    "codex local websocket bridge unavailable in stdio mode"
+                );
+                shutdown.notified().await;
+                return Ok(());
+            }
+            CodexMode::Websocket => {
+                let (host, port) = self.ensure_codex_running().await?;
+                info!(
+                    %host,
+                    port,
+                    "codex local websocket listener is managed by Codex child"
+                );
+                shutdown.notified().await;
+                return Ok(());
+            }
+            CodexMode::UnixDaemon | CodexMode::UnixProxy => {}
+        }
+
+        let listener = TcpListener::bind((host.as_str(), port))
+            .await
+            .with_context(|| format!("binding codex local websocket bridge on {host}:{port}"))?;
+        info!(
+            %host,
+            port,
+            "codex local websocket bridge listening"
+        );
+
+        loop {
+            tokio::select! {
+                _ = shutdown.notified() => {
+                    info!("codex local websocket bridge shutting down");
+                    return Ok(());
+                }
+                accepted = listener.accept() => {
+                    let (stream, peer_addr) = accepted.context("accepting codex local websocket client")?;
+                    let manager = self.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = manager.serve_codex(stream).await {
+                            warn!(%peer_addr, "codex local websocket client ended with error: {error:#}");
+                        }
+                    });
+                }
+            }
+        }
+    }
+
     /// Fan out a shutdown call to every registered bridge. Called from
     /// the daemon's graceful shutdown path so each bridge can kill its
     /// child processes (ACP agents, claude, etc.) before the daemon
@@ -473,32 +542,32 @@ impl AgentManager {
     }
 
     async fn restart_codex(&self) -> anyhow::Result<()> {
-        if self.codex_mode == CodexMode::UnixDaemon {
-            let bin = self.codex_bin.clone();
-            run_codex_app_server_daemon(&bin, "restart")
-                .await
-                .map(|_| ())?;
-            return Ok(());
-        }
-
-        if self.stop_codex_child().await {
-            return Ok(());
-        }
-
-        if self.codex_mode == CodexMode::UnixProxy {
-            return Err(anyhow!(
-                "codex app-server Unix socket is not owned by this daemon"
-            ));
-        }
-
-        let (host, port) = {
-            let cfg = self.config.load();
-            (cfg.agents.codex.host.clone(), cfg.agents.codex.port)
-        };
-        if TcpStream::connect((host.as_str(), port)).await.is_ok() {
-            return Err(anyhow!(
-                "codex app-server on {host}:{port} is not owned by this daemon"
-            ));
+        match self.codex_mode {
+            CodexMode::UnixDaemon => {
+                let bin = self.codex_bin.clone();
+                run_codex_app_server_daemon(&bin, "restart")
+                    .await
+                    .map(|_| ())?;
+            }
+            CodexMode::UnixProxy => {
+                self.stop_codex_child().await;
+                let endpoint = self.ensure_codex_unix_running().await?;
+                info!(
+                    socket = ?endpoint.socket_path,
+                    "codex app-server UnixProxy restarted"
+                );
+            }
+            CodexMode::Websocket => {
+                self.stop_codex_child().await;
+                let (host, port) = self.ensure_codex_running().await?;
+                info!(%host, port, "codex websocket app-server restarted");
+            }
+            CodexMode::Stdio => {
+                // Stdio mode has no shared app-server to restart; each client
+                // stream owns its own child. Treat restart as a successful
+                // no-op so mobile Home remains safe on older Codex builds.
+                info!("codex stdio mode has no shared app-server to restart");
+            }
         }
         Ok(())
     }
@@ -514,16 +583,22 @@ impl AgentManager {
         false
     }
 
-    async fn serve_codex(&self, iroh_stream: IrohStream) -> anyhow::Result<()> {
+    async fn serve_codex<S>(&self, stream: S) -> anyhow::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         match self.codex_mode {
-            CodexMode::UnixDaemon => self.serve_codex_unix_proxy(iroh_stream).await,
-            CodexMode::UnixProxy => self.serve_codex_unix_proxy(iroh_stream).await,
-            CodexMode::Websocket => self.serve_codex_ws(iroh_stream).await,
-            CodexMode::Stdio => self.serve_codex_stdio(iroh_stream).await,
+            CodexMode::UnixDaemon => self.serve_codex_unix_proxy(stream).await,
+            CodexMode::UnixProxy => self.serve_codex_unix_proxy(stream).await,
+            CodexMode::Websocket => self.serve_codex_ws(stream).await,
+            CodexMode::Stdio => self.serve_codex_stdio(stream).await,
         }
     }
 
-    async fn serve_codex_unix_proxy(&self, mut iroh_stream: IrohStream) -> anyhow::Result<()> {
+    async fn serve_codex_unix_proxy<S>(&self, client_stream: S) -> anyhow::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let endpoint = if self.codex_mode == CodexMode::UnixDaemon {
             self.ensure_codex_daemon_running().await?
         } else {
@@ -551,6 +626,8 @@ impl AgentManager {
                     endpoint.bin.display()
                 )
             })?;
+        let proxy_pid = child.id();
+        info!(pid = ?proxy_pid, "codex app-server proxy spawned");
 
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
@@ -563,18 +640,50 @@ impl AgentManager {
             }
         });
 
-        let mut child_io = tokio::io::join(stdout, stdin);
-        let _ = tokio::io::copy_bidirectional(&mut iroh_stream, &mut child_io).await;
-        let _ = child.wait().await;
+        let (mut client_read, mut client_write) = tokio::io::split(client_stream);
+        let mut child_read = stdout;
+        let mut child_write = stdin;
+        let copy_result = tokio::select! {
+            result = tokio::io::copy(&mut client_read, &mut child_write) => {
+                result.context("copying client stream to codex app-server proxy")
+            }
+            result = tokio::io::copy(&mut child_read, &mut client_write) => {
+                let _ = client_write.shutdown().await;
+                result.context("copying codex app-server proxy stream to client")
+            }
+        };
+        drop(child_read);
+        drop(child_write);
+
+        match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+            Ok(Ok(status)) => info!(pid = ?proxy_pid, %status, "codex app-server proxy exited"),
+            Ok(Err(error)) => {
+                warn!(pid = ?proxy_pid, "failed waiting for codex app-server proxy: {error:#}")
+            }
+            Err(_) => {
+                warn!(
+                    pid = ?proxy_pid,
+                    "codex app-server proxy did not exit after stream closed; killing"
+                );
+                if let Err(error) = child.kill().await {
+                    warn!(pid = ?proxy_pid, "failed killing codex app-server proxy: {error:#}");
+                }
+            }
+        }
+
+        copy_result.context("copying codex app-server proxy stream")?;
         Ok(())
     }
 
-    async fn serve_codex_ws(&self, mut iroh_stream: IrohStream) -> anyhow::Result<()> {
+    async fn serve_codex_ws<S>(&self, mut client_stream: S) -> anyhow::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let (host, port) = self.ensure_codex_running().await?;
         let mut tcp = TcpStream::connect((host.as_str(), port))
             .await
             .with_context(|| format!("connecting to codex app-server at {host}:{port}"))?;
-        let _ = tokio::io::copy_bidirectional(&mut iroh_stream, &mut tcp).await;
+        let _ = tokio::io::copy_bidirectional(&mut client_stream, &mut tcp).await;
         Ok(())
     }
 
@@ -619,8 +728,8 @@ impl AgentManager {
             self.codex_bin.clone()
         };
 
-        let endpoint = match probe_codex_app_server_proxy(&bin, None).await {
-            Ok(()) => return Ok(CodexUnixEndpoint::default_socket(bin)),
+        let default_endpoint = match probe_codex_app_server_proxy(&bin, None).await {
+            Ok(()) => Some(CodexUnixEndpoint::default_socket(bin.clone())),
             Err(error) => {
                 if let Some(socket_path) = default_codex_control_socket_accepts_connections().await
                 {
@@ -628,17 +737,49 @@ impl AgentManager {
                         "codex default control socket accepts connections but proxy websocket handshake failed; using alleycat-owned socket default_socket={} error={error:#}",
                         socket_path.display()
                     );
-                    CodexUnixEndpoint::custom_socket(
-                        bin,
-                        alleycat_codex_control_socket_path(&socket_path),
-                    )
-                } else {
-                    CodexUnixEndpoint::default_socket(bin)
                 }
+                None
             }
         };
 
         let mut guard = self.codex_child.lock().await;
+        let endpoint = if let Some(default_endpoint) = default_endpoint {
+            if let Some(child) = guard.as_mut() {
+                match child.try_wait() {
+                    Ok(None) => return Ok(default_endpoint),
+                    Ok(Some(status)) => {
+                        info!("discarding exited codex app-server child status={status}");
+                        *guard = None;
+                    }
+                    Err(error) => {
+                        warn!("discarding codex app-server child after try_wait failed: {error}");
+                        *guard = None;
+                    }
+                }
+            }
+
+            // A reachable default socket with no tracked child is likely an
+            // external Codex daemon/Desktop (or an orphan from a prior build).
+            // Mobile restart must remain actionable, so Alleycat uses its own
+            // control socket instead of attaching to an app-server it cannot
+            // restart safely.
+            if let Some(socket_path) = default_codex_control_socket_path() {
+                warn!(
+                    default_socket = %socket_path.display(),
+                    "codex default control socket is not tracked by this daemon; using alleycat-owned socket"
+                );
+                CodexUnixEndpoint::custom_socket(
+                    default_endpoint.bin,
+                    alleycat_codex_control_socket_path(&socket_path),
+                )
+            } else {
+                default_endpoint
+            }
+        } else if let Some(socket_path) = default_codex_control_socket_accepts_connections().await {
+            CodexUnixEndpoint::custom_socket(bin, alleycat_codex_control_socket_path(&socket_path))
+        } else {
+            CodexUnixEndpoint::default_socket(bin)
+        };
         match probe_codex_app_server_proxy(&endpoint.bin, endpoint.socket_path.as_deref()).await {
             Ok(()) => return Ok(endpoint),
             Err(error) => {
@@ -763,7 +904,10 @@ impl AgentManager {
     /// Per-stream stdio bridge for codex versions that don't support
     /// `--listen`. Each iroh stream gets its own `codex app-server` child;
     /// codex's on-disk session store handles resume across reconnects.
-    async fn serve_codex_stdio(&self, mut iroh_stream: IrohStream) -> anyhow::Result<()> {
+    async fn serve_codex_stdio<S>(&self, mut client_stream: S) -> anyhow::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let bin = {
             let cfg = self.config.load();
             if !cfg.agents.codex.enabled {
@@ -793,7 +937,7 @@ impl AgentManager {
         });
 
         let mut child_io = tokio::io::join(stdout, stdin);
-        let _ = tokio::io::copy_bidirectional(&mut iroh_stream, &mut child_io).await;
+        let _ = tokio::io::copy_bidirectional(&mut client_stream, &mut child_io).await;
         let _ = child.wait().await;
         Ok(())
     }

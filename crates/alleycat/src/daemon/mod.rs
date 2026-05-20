@@ -83,6 +83,15 @@ pub async fn run() -> anyhow::Result<()> {
             }
         })
     };
+    let codex_local_tcp_task = {
+        let agents = agents.clone();
+        let shutdown = Arc::clone(&shutdown);
+        tokio::spawn(async move {
+            if let Err(error) = agents.serve_codex_local_tcp_bridge(shutdown).await {
+                warn!("codex local websocket bridge ended: {error:#}");
+            }
+        })
+    };
 
     let listener = ControlListener::bind()
         .await
@@ -113,6 +122,15 @@ pub async fn run() -> anyhow::Result<()> {
         Err(_) => {
             warn!("iroh shutdown did not complete within 5s; aborting");
             serve_abort.abort();
+        }
+    }
+
+    let codex_local_tcp_abort = codex_local_tcp_task.abort_handle();
+    match tokio::time::timeout(std::time::Duration::from_secs(5), codex_local_tcp_task).await {
+        Ok(_) => {}
+        Err(_) => {
+            warn!("codex local websocket bridge did not stop within 5s; aborting");
+            codex_local_tcp_abort.abort();
         }
     }
 
