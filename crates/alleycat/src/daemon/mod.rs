@@ -92,6 +92,15 @@ pub async fn run() -> anyhow::Result<()> {
             }
         })
     };
+    let desktop_agent_router_task = {
+        let agents = agents.clone();
+        let shutdown = Arc::clone(&shutdown);
+        tokio::spawn(async move {
+            if let Err(error) = agents.serve_desktop_agent_router(shutdown).await {
+                warn!("desktop agent router ended: {error:#}");
+            }
+        })
+    };
 
     let listener = ControlListener::bind()
         .await
@@ -131,6 +140,15 @@ pub async fn run() -> anyhow::Result<()> {
         Err(_) => {
             warn!("codex local websocket bridge did not stop within 5s; aborting");
             codex_local_tcp_abort.abort();
+        }
+    }
+
+    let desktop_agent_router_abort = desktop_agent_router_task.abort_handle();
+    match tokio::time::timeout(std::time::Duration::from_secs(5), desktop_agent_router_task).await {
+        Ok(_) => {}
+        Err(_) => {
+            warn!("desktop agent router did not stop within 5s; aborting");
+            desktop_agent_router_abort.abort();
         }
     }
 

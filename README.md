@@ -59,7 +59,7 @@ The daemon talks to the CLI over a Unix domain socket on macOS/Linux and a per-u
 
 | Agent | Spawned by daemon? | How |
 |---|---|---|
-| `codex` | Yes, one shared backend | Uses Codex's Unix app-server socket by default: Alleycat lazy-spawns `codex app-server --listen unix://` only when no existing socket answers, proxies each iroh stream through `codex app-server proxy`, and exposes the configured loopback `host`/`port` as a local websocket bridge for desktop clients. Older Codex CLIs fall back to `codex app-server --listen ws://<host>:<port>` or stdio. |
+| `codex` | Yes, one shared backend | Uses Codex's Unix app-server socket by default: Alleycat lazy-spawns `codex app-server --listen unix://` only when no existing socket answers, proxies each iroh stream through `codex app-server proxy`, and exposes the configured loopback `host`/`port` as a local websocket bridge for desktop clients. A provider-router experiment listens on `port + 1` with paths such as `/agent/claude` for Codex Desktop sessions backed by non-Codex Alleycat bridges. Older Codex CLIs fall back to `codex app-server --listen ws://<host>:<port>` or stdio. |
 | `pi` | Yes, per codex thread | `PiPool` spawns `pi --mode rpc` on demand, bounded at 16 processes with a 10-minute idle reap and LRU eviction. |
 | `amp` | Yes, per turn | Spawns `amp --execute --stream-json --stream-json-thinking --stream-json-input` for each turn, translates Amp stream JSON into codex app-server lifecycle events, stores Alleycat-owned thread records, and saves Amp's `T-*` thread id for continuation. |
 | `opencode` | Yes, one shared backend | Lazy spawn of `opencode serve --port=auto --auth-token=auto` on first connect, gated on `/global/health`. Or set `OPENCODE_BRIDGE_BACKEND_URL` to point at an existing instance. |
@@ -139,7 +139,7 @@ bin = "hermes"
 api_base = "http://127.0.0.1:8642"
 ```
 
-Reload swaps config that's read per-request (token, agent enable flags). Codex's `bin`/`host`/`port`, pi's `bin`, Amp's `bin`/permission mode, OpenCode's `bin`/runtime port, Droid's `bin`, and Hermes's `bin`/`api_base` are pinned at first spawn; changing those requires `alleycat stop` + `serve`. Codex `host`/`port` are used for the local desktop websocket bridge and for the legacy websocket fallback. For Hermes API mode, bind the Hermes gateway to loopback and put `API_SERVER_KEY`/`HERMES_API_KEY` only in the Alleycat daemon environment; mobile clients authenticate through Alleycat pairing and never receive the Hermes key.
+Reload swaps config that's read per-request (token, agent enable flags). Codex's `bin`/`host`/`port`, pi's `bin`, Amp's `bin`/permission mode, OpenCode's `bin`, Droid's `bin`, and Hermes's `bin`/`api_base` are pinned at first spawn; changing those requires `alleycat stop` + `serve`. Codex `host`/`port` are used for the local desktop websocket bridge, the provider-router experiment (`port + 1`), and the legacy websocket fallback. For Hermes API mode, bind the Hermes gateway to loopback and put `API_SERVER_KEY`/`HERMES_API_KEY` only in the Alleycat daemon environment; mobile clients authenticate through Alleycat pairing and never receive the Hermes key.
 
 ## File layout
 

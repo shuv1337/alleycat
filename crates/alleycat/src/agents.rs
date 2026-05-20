@@ -1,14 +1,16 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use alleycat_acp_bridge::AcpBridge;
 use alleycat_amp_bridge::AmpBridge;
 use alleycat_bridge_core::codex_resolver::{newest_codex_candidates_first, program_candidates};
 use alleycat_bridge_core::session::{Session, SessionRegistry, SessionRegistryConfig};
-use alleycat_bridge_core::{Bridge, LocalLauncher};
+use alleycat_bridge_core::{
+    Bridge, Conn, InboundMessage, JsonRpcMessage, JsonRpcResponse, JsonRpcVersion, LocalLauncher,
+};
 use alleycat_claude_bridge::ClaudeBridge;
 use alleycat_devin_bridge::DevinBridge;
 use alleycat_droid_bridge::DroidBridge;
@@ -18,13 +20,16 @@ use alleycat_opencode_bridge::OpencodeBridge;
 use alleycat_pi_bridge::PiBridge;
 use anyhow::{Context, anyhow};
 use arc_swap::ArcSwap;
+use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 #[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, Notify, OnceCell};
+use tokio::sync::{Mutex, Notify, OnceCell, mpsc};
+use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
 use crate::agent_manifest::{MANIFESTS, manifest_for};
@@ -378,6 +383,192 @@ impl AgentManager {
         }
     }
 
+    /// Local websocket JSON-RPC router for Codex Desktop provider experiments.
+    ///
+    /// The production Codex bridge remains on the configured Codex port
+    /// (`8390` by default). This router listens on `port + 1` and serves one
+    /// non-Codex Alleycat bridge selected by the request path:
+    ///
+    /// - `ws://127.0.0.1:8391/agent/claude`
+    /// - `ws://127.0.0.1:8391/agent/opencode`
+    ///
+    /// Keeping this on a separate port lets the default Desktop launch continue
+    /// to byte-proxy directly to Codex while we validate provider-backed
+    /// Desktop sessions.
+    pub async fn serve_desktop_agent_router(&self, shutdown: Arc<Notify>) -> anyhow::Result<()> {
+        let (host, port) = {
+            let cfg = self.config.load();
+            let port =
+                cfg.agents.codex.port.checked_add(1).ok_or_else(|| {
+                    anyhow!("codex port cannot be incremented for desktop router")
+                })?;
+            (cfg.agents.codex.host.clone(), port)
+        };
+        let listener = TcpListener::bind((host.as_str(), port))
+            .await
+            .with_context(|| format!("binding desktop agent router on {host}:{port}"))?;
+        info!(%host, port, "desktop agent router listening");
+
+        loop {
+            tokio::select! {
+                _ = shutdown.notified() => {
+                    info!("desktop agent router shutting down");
+                    return Ok(());
+                }
+                accepted = listener.accept() => {
+                    let (stream, peer_addr) = accepted.context("accepting desktop agent router client")?;
+                    let manager = self.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = manager.serve_desktop_agent_router_client(stream).await {
+                            warn!(%peer_addr, "desktop agent router client ended with error: {error:#}");
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    async fn serve_desktop_agent_router_client(&self, stream: TcpStream) -> anyhow::Result<()> {
+        let selected_agent = Arc::new(StdMutex::new(None::<String>));
+        let selected_for_handshake = Arc::clone(&selected_agent);
+        let ws = tokio_tungstenite::accept_hdr_async(
+            stream,
+            move |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                  response| {
+                let agent = desktop_router_agent_from_uri(request.uri());
+                *selected_for_handshake
+                    .lock()
+                    .expect("selected agent mutex poisoned") = agent;
+                Ok(response)
+            },
+        )
+        .await
+        .context("accepting desktop router websocket")?;
+        let agent = selected_agent
+            .lock()
+            .expect("selected agent mutex poisoned")
+            .clone()
+            .ok_or_else(|| anyhow!("desktop router websocket path must include /agent/<name>"))?;
+        let kind = agent_kind_from_str(&agent)
+            .ok_or_else(|| anyhow!("unknown desktop agent `{agent}`"))?;
+        if !self.config.load().agents.is_enabled(kind) {
+            return Err(anyhow!("agent `{agent}` is disabled"));
+        }
+        let bridge = self.bridge_for_kind(kind).await?;
+        let agent_id = agent_kind_str(kind);
+        let session = self
+            .session_registry
+            .get_or_create(format!("desktop-local-{agent_id}"), agent_id);
+        let conn = Conn::from_session(Arc::clone(&session));
+        let (mut ws_write, mut ws_read) = ws.split();
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Value>();
+
+        let writer_task = tokio::spawn(async move {
+            while let Some(value) = out_rx.recv().await {
+                let text = match serde_json::to_string(&value) {
+                    Ok(text) => text,
+                    Err(error) => {
+                        warn!("failed serializing desktop router frame: {error:#}");
+                        continue;
+                    }
+                };
+                if ws_write.send(Message::Text(text.into())).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        let drainer_session = Arc::clone(&session);
+        let drainer_tx = out_tx.clone();
+        let drainer_task = tokio::spawn(async move {
+            drain_desktop_router_session(drainer_session, drainer_tx).await;
+        });
+
+        info!(agent = agent_id, "desktop agent router client attached");
+        while let Some(message) = ws_read.next().await {
+            let message = message.context("reading desktop router websocket message")?;
+            let value = match message {
+                Message::Text(text) => serde_json::from_str::<Value>(&text)
+                    .context("parsing desktop router JSON text frame")?,
+                Message::Binary(bytes) => serde_json::from_slice::<Value>(&bytes)
+                    .context("parsing desktop router JSON binary frame")?,
+                Message::Close(_) => break,
+                Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
+            };
+            let inbound = match InboundMessage::from_value(value.clone()) {
+                Ok(inbound) => inbound,
+                Err(error) => {
+                    warn!(raw = %value, "discarding malformed desktop router JSON-RPC frame: {error}");
+                    continue;
+                }
+            };
+            match inbound {
+                InboundMessage::Request(request) => {
+                    let bridge = Arc::clone(&bridge);
+                    let conn = conn.clone();
+                    let out_tx = out_tx.clone();
+                    tokio::spawn(async move {
+                        let id = request.id;
+                        let method = request.method;
+                        let params = request.params.unwrap_or(Value::Null);
+                        let result = if method == "initialize" {
+                            conn.set_initialize_capabilities(&params);
+                            bridge.initialize(&conn, params).await
+                        } else if let Some(result) = desktop_router_stub_response(&method) {
+                            Ok(result)
+                        } else {
+                            bridge.dispatch(&conn, &method, params).await
+                        };
+                        let response = match result {
+                            Ok(result) => JsonRpcResponse {
+                                jsonrpc: JsonRpcVersion,
+                                id,
+                                result: Some(result),
+                                error: None,
+                            },
+                            Err(error) => JsonRpcResponse {
+                                jsonrpc: JsonRpcVersion,
+                                id,
+                                result: None,
+                                error: Some(error),
+                            },
+                        };
+                        let value = serde_json::to_value(JsonRpcMessage::Response(response))
+                            .unwrap_or_else(|_| {
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "error": {
+                                        "code": -32603,
+                                        "message": "failed to encode response"
+                                    }
+                                })
+                            });
+                        let _ = out_tx.send(value);
+                    });
+                }
+                InboundMessage::Notification(notification) => {
+                    bridge
+                        .notification(
+                            &conn,
+                            &notification.method,
+                            notification.params.unwrap_or(Value::Null),
+                        )
+                        .await;
+                }
+                InboundMessage::Response(response) => {
+                    conn.notifier().resolve_response(response).await;
+                }
+            }
+        }
+
+        session.drop_attachment();
+        drop(out_tx);
+        let _ = drainer_task.await;
+        let _ = writer_task.await;
+        info!(agent = agent_id, "desktop agent router client detached");
+        Ok(())
+    }
+
     /// Fan out a shutdown call to every registered bridge. Called from
     /// the daemon's graceful shutdown path so each bridge can kill its
     /// child processes (ACP agents, claude, etc.) before the daemon
@@ -486,19 +677,24 @@ impl AgentManager {
         if !self.config.load().agents.is_enabled(kind) {
             return Err(anyhow!("agent `{}` is disabled", agent_kind_str(kind)));
         }
-        let bridge: Arc<dyn Bridge> =
-            match kind {
-                AgentKind::Opencode => {
-                    let oc = self.opencode_bridge_arc().await?;
-                    oc as Arc<dyn Bridge>
-                }
-                other => self.bridges.get(&other).cloned().ok_or_else(|| {
-                    anyhow!("agent `{}` is not configured", agent_kind_str(other))
-                })?,
-            };
+        let bridge = self.bridge_for_kind(kind).await?;
         alleycat_bridge_core::serve_stream_with_session(bridge, stream, session, last_seen)
             .await
             .with_context(|| format!("serving `{}` bridge stream", agent_kind_str(kind)))
+    }
+
+    async fn bridge_for_kind(&self, kind: AgentKind) -> anyhow::Result<Arc<dyn Bridge>> {
+        match kind {
+            AgentKind::Opencode => {
+                let oc = self.opencode_bridge_arc().await?;
+                Ok(oc as Arc<dyn Bridge>)
+            }
+            other => self
+                .bridges
+                .get(&other)
+                .cloned()
+                .ok_or_else(|| anyhow!("agent `{}` is not configured", agent_kind_str(other))),
+        }
     }
 
     /// Stable static name for a wire-supplied agent string, used to key the
@@ -1476,6 +1672,98 @@ fn resolve_pi_bin(configured: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+async fn drain_desktop_router_session(session: Arc<Session>, out_tx: mpsc::UnboundedSender<Value>) {
+    let attach = session.install_attachment(None);
+    for sequenced in attach.backlog {
+        session.note_drainer_attempt(sequenced.seq);
+        if out_tx.send(sequenced.payload).is_err() {
+            return;
+        }
+    }
+    if let Some(payload) = attach.replay_redelivery
+        && out_tx.send(payload).is_err()
+    {
+        return;
+    }
+    let mut live_rx = attach.live_rx;
+    while let Some(sequenced) = live_rx.recv().await {
+        session.note_drainer_attempt(sequenced.seq);
+        if out_tx.send(sequenced.payload).is_err() {
+            break;
+        }
+    }
+}
+
+fn desktop_router_agent_from_uri(uri: &impl std::fmt::Display) -> Option<String> {
+    let raw = uri.to_string();
+    let (path, query) = raw
+        .split_once('?')
+        .map_or((raw.as_str(), None), |(path, query)| (path, Some(query)));
+    if let Some(agent) = query.and_then(agent_from_query) {
+        return Some(agent);
+    }
+    let path = path.trim_matches('/');
+    let agent = path
+        .strip_prefix("agent/")
+        .or_else(|| path.strip_prefix("agents/"))
+        .unwrap_or(path);
+    sanitize_desktop_agent(agent)
+}
+
+fn agent_from_query(query: &str) -> Option<String> {
+    query.split('&').find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        if key == "agent" {
+            sanitize_desktop_agent(value)
+        } else {
+            None
+        }
+    })
+}
+
+fn sanitize_desktop_agent(agent: &str) -> Option<String> {
+    let agent = agent.trim().trim_matches('/');
+    if agent.is_empty() || agent == "codex" {
+        return None;
+    }
+    let valid = agent
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+    valid.then(|| agent.replace('_', "-"))
+}
+
+fn desktop_router_stub_response(method: &str) -> Option<Value> {
+    match method {
+        "app/list"
+        | "plugin/list"
+        | "plugin/share/list"
+        | "marketplace/list"
+        | "thread/loaded/list"
+        | "experimentalFeature/list"
+        | "collaborationMode/list" => Some(json!({"data":[],"nextCursor":null})),
+        "hooks/list" => Some(json!({"data":[],"hooks":[],"nextCursor":null})),
+        "thread/goal/get" => Some(json!({"goal":null})),
+        "thread/backgroundTerminals/clean"
+        | "config/mcpServer/reload"
+        | "experimentalFeature/enablement/set"
+        | "marketplace/add"
+        | "plugin/install"
+        | "account/login/start"
+        | "account/login/cancel"
+        | "account/logout"
+        | "feedback/upload" => Some(json!({})),
+        "account/rateLimits/read" => Some(json!({"rateLimits":[]})),
+        "getAuthStatus" => Some(json!({
+            "authMethod": "apikey",
+            "authToken": null,
+            "requiresAuth": false,
+            "email": null,
+            "planAtLogin": null
+        })),
+        _ => None,
+    }
 }
 
 fn agent_kind_from_str(name: &str) -> Option<AgentKind> {
