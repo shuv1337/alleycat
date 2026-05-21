@@ -30,6 +30,19 @@ Alleycat is a Rust workspace for an Iroh-backed daemon that multiplexes local co
 - OpenCode is lazily spawned by Alleycat with `opencode serve --port=<auto>` on first paired connection; local standalone `opencode serve` should not be left running unless intentionally testing outside Alleycat.
 - The daemon spawns external CLIs on demand; availability is environment-dependent.
 
+### Codex app-server lifecycle (orphan-daemon policy)
+
+This fork **never** uses `CodexMode::UnixDaemon`, even when the local `codex` build supports `codex app-server daemon start`. Background:
+
+- Upstream's `codex app-server daemon start` is the SSH/remote-deploy lifecycle manager. It double-forks and reparents the daemon to `systemd --user`, so the daemon outlives the process that started it.
+- For a long-running local `alleycat serve`, that means the codex daemon survives `systemctl --user restart alleycat.service` and keeps whatever `cwd`/`env`/`PWD` it inherited at first launch. If the first launch happened while alleycat (or anything that shelled `codex`) was inside a project directory, every future chat opens in that project directory until the orphan is killed manually.
+- `detect_codex_runtime()` (`crates/alleycat/src/agents.rs`) therefore skips the `UnixDaemon` branch and prefers `UnixProxy`. The retained `_codex_app_server_daemon_supported` probe is kept for documentation / future remote-bridge use and is `#[allow(dead_code)]`.
+- `codex_command(bin)` pins every spawned `codex …` invocation to `current_dir($HOME)` as defense-in-depth. Any daemon that does escape (e.g. via an upstream bug) at least starts from `$HOME`, not from a stale project dir.
+- Operational implication: there is **no codex app-server outside alleycat's cgroup** in steady state. If you see one, it is a regression — kill it, remove `~/.codex/app-server-daemon/app-server.pid` and `~/.codex/app-server-control/app-server-control.sock`, restart alleycat, and investigate the path that bypassed alleycat.
+- The codex CLI wrapper at `~/dotfiles/codex/codex` and the Codex Desktop launcher (`~/repos/codex-desktop-linux/launcher/start.sh.template`) both refuse to start without a healthy alleycat, so the only legitimate path to a codex app-server child is through alleycat.
+
+## Parallel local alleycat instances
+
 ## Parallel local alleycat instances
 
 Two distinct alleycat repos run on this machine simultaneously under the same binary name. Always disambiguate before restarting, killing, installing, or editing — they share zero state but share the binary name and several conventions.

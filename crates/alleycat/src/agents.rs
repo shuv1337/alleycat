@@ -1370,16 +1370,39 @@ async fn hermes_api_available(api_base: &str, timeout_ms: u64) -> bool {
 }
 
 fn codex_command(bin: &Path) -> Command {
-    #[cfg(windows)]
-    if codex_needs_windows_cmd_shell(bin) {
-        let shell =
-            std::env::var_os("ComSpec").unwrap_or_else(|| std::ffi::OsString::from("cmd.exe"));
-        let mut command = Command::new(shell);
-        command.arg("/d").arg("/c").arg(bin);
-        return command;
+    let mut command = {
+        #[cfg(windows)]
+        {
+            if codex_needs_windows_cmd_shell(bin) {
+                let shell = std::env::var_os("ComSpec")
+                    .unwrap_or_else(|| std::ffi::OsString::from("cmd.exe"));
+                let mut cmd = Command::new(shell);
+                cmd.arg("/d").arg("/c").arg(bin);
+                cmd
+            } else {
+                Command::new(bin)
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            Command::new(bin)
+        }
+    };
+
+    // Pin every spawned `codex` invocation to $HOME so any long-lived
+    // children (in particular `codex app-server --listen unix://` and
+    // `codex app-server proxy`) never inherit a transient project
+    // directory. Without this, a leaked daemon can stick the user
+    // inside whatever dir alleycat happened to be invoked from when it
+    // first spawned the codex child. See AGENTS.md ("orphan codex
+    // daemon") for the failure mode this guards against.
+    if let Some(home) = std::env::var_os("HOME")
+        && !home.is_empty()
+    {
+        command.current_dir(home);
     }
 
-    Command::new(bin)
+    command
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1461,12 +1484,18 @@ async fn detect_codex(bin: &str) -> CodexDetection {
         help.push_str(&String::from_utf8_lossy(&output.stderr));
         let listen_supported = help.contains("--listen");
         let proxy_supported = codex_app_server_proxy_supported(&candidate).await;
-        let daemon_supported = listen_supported
-            && proxy_supported
-            && codex_app_server_daemon_supported(&candidate).await;
-        let mode = if daemon_supported {
-            CodexMode::UnixDaemon
-        } else if listen_supported && proxy_supported {
+        // NOTE: We intentionally do NOT select `CodexMode::UnixDaemon`
+        // even when upstream's `codex app-server daemon` lifecycle is
+        // supported. That mode delegates daemon ownership to upstream
+        // codex CLI, which double-forks and reparents the daemon to
+        // `systemd --user`; the daemon then outlives alleycat
+        // restarts, retains stale cwd / env, and silently traps the
+        // user inside whatever directory the very first launch came
+        // from. Prefer `UnixProxy` so the daemon runs as an alleycat
+        // `kill_on_drop` child that dies with the alleycat process and
+        // is respawned cleanly with $HOME cwd on next request. See
+        // AGENTS.md ("orphan codex daemon").
+        let mode = if listen_supported && proxy_supported {
             CodexMode::UnixProxy
         } else if listen_supported {
             CodexMode::Websocket
@@ -1504,7 +1533,14 @@ async fn codex_app_server_proxy_supported(bin: &Path) -> bool {
     )
 }
 
-async fn codex_app_server_daemon_supported(bin: &Path) -> bool {
+// `codex app-server daemon` is still useful for SSH/remote deploys
+// where the daemon must outlive the alleycat connection. Local
+// alleycat now ignores this probe so the codex daemon is always
+// alleycat's child (`UnixProxy`). Kept for reference / future
+// remote-bridge support; underscore-prefixed so dead-code-lint stays
+// clean if the function is otherwise unused.
+#[allow(dead_code)]
+async fn _codex_app_server_daemon_supported(bin: &Path) -> bool {
     matches!(
         tokio::time::timeout(
             Duration::from_secs(5),
