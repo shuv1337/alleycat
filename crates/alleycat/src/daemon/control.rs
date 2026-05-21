@@ -74,6 +74,9 @@ pub struct StatusInfo {
     /// for forwards compatibility with daemons that predate the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// Local HTTP/WebSocket endpoint, when `serve --serve-pwa` is active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -26,7 +26,7 @@ Alleycat is a Rust workspace for an Iroh-backed daemon that multiplexes local co
 - On Linux, `alleycat install` writes/enables `~/.config/systemd/user/alleycat.service`; inspect with `systemctl --user status alleycat.service`.
 - Runtime state and daemon logs live under `~/.local/state/alleycat/`; recent connection activity is in `~/.local/state/alleycat/logs/daemon.log.<date>`.
 - Pairing payload/QR is printed with `alleycat pair --qr`; rotate exposed pairing tokens with `alleycat rotate`.
-- Current upstream Codex handling prefers Codex's Unix app-server/proxy flow (`codex app-server --listen unix://` plus `codex app-server proxy`). The daemon also binds the configured loopback TCP `host`/`port` as a local websocket bridge for Codex Desktop clients, while older websocket-only Codex CLIs use that same address for the managed Codex child. A provider-router experiment listens on `port + 1` with paths like `/agent/claude` or `/agent/opencode`; it speaks Desktop websocket JSON-RPC and dispatches to the selected non-Codex Alleycat bridge.
+- Current upstream Codex handling prefers Codex's Unix app-server/proxy flow (`codex app-server --listen unix://` plus `codex app-server proxy`). The daemon also binds the configured loopback TCP `host`/`port` as a local websocket bridge for Codex Desktop clients, while older websocket-only Codex CLIs use that same address for the managed Codex child. A provider-router experiment listens on `port + 1` with paths like `/agent/claude` or `/agent/opencode`; it speaks Desktop websocket JSON-RPC and dispatches to the selected non-Codex Alleycat bridge. The PWA browser adapter is available behind `alleycat serve --serve-pwa`; it is opt-in and should not be enabled on the production systemd service without explicit confirmation.
 - OpenCode is lazily spawned by Alleycat with `opencode serve --port=<auto>` on first paired connection; local standalone `opencode serve` should not be left running unless intentionally testing outside Alleycat.
 - The daemon spawns external CLIs on demand; availability is environment-dependent.
 
@@ -56,7 +56,7 @@ Two distinct alleycat repos run on this machine simultaneously under the same bi
 | Ports | `127.0.0.1:8390` (codex bridge), `127.0.0.1:8391` (provider router) | `127.0.0.1:5851` (`--serve-pwa --pwa-dir .../litter-pwa/apps/web/dist`) |
 | `HOME` / state | `~`, `~/.config/alleycat/`, `~/.local/state/alleycat/` | `/tmp/litter-pwa-alleycat-home/{,.config,.local/state,.run}` (isolated `XDG_CONFIG_HOME`/`XDG_STATE_HOME`/`XDG_RUNTIME_DIR`) |
 | Identify by cgroup | `/user.slice/.../app.slice/alleycat.service` | none (parent is the tmux server PID) |
-| Unique CLI flags | `serve` (default) | `--serve-pwa` and `--pwa-dir` — upstream-only, do **not** exist in this fork |
+| Unique runtime mode | systemd runs plain `serve`; this fork also supports optional `serve --serve-pwa` for browser-adapter testing | tmux runs `serve --serve-pwa --pwa-dir .../litter-pwa/apps/web/dist` |
 
 Rules:
 

@@ -675,6 +675,25 @@ impl AgentManager {
         }
     }
 
+    /// Session-aware dispatch for browser WebSocket streams. Codex currently
+    /// stays on the native iroh stream path because its app-server proxy code
+    /// depends on iroh's bidirectional stream wrapper.
+    pub async fn serve_bridge_agent_with_session<S>(
+        &self,
+        agent: &str,
+        stream: S,
+        session: Arc<Session>,
+        last_seen: Option<u64>,
+    ) -> anyhow::Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let kind = agent_kind_from_str(agent)
+            .ok_or_else(|| anyhow!("agent `{agent}` is not available over websocket"))?;
+        self.serve_with_session(kind, stream, session, last_seen)
+            .await
+    }
+
     /// Polymorphic Bridge dispatch. Pi/Claude come straight from the eagerly-
     /// built `bridges` map; opencode initializes lazily on first use.
     pub async fn serve_with_session<S>(
