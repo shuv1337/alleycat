@@ -26,7 +26,12 @@ Alleycat is a Rust workspace for an Iroh-backed daemon that multiplexes local co
 - On Linux, `alleycat install` writes/enables `~/.config/systemd/user/alleycat.service`; inspect with `systemctl --user status alleycat.service`.
 - Runtime state and daemon logs live under `~/.local/state/alleycat/`; recent connection activity is in `~/.local/state/alleycat/logs/daemon.log.<date>`.
 - Pairing payload/QR is printed with `alleycat pair --qr`; rotate exposed pairing tokens with `alleycat rotate`.
-- Current upstream Codex handling prefers Codex's Unix app-server/proxy flow (`codex app-server --listen unix://` plus `codex app-server proxy`). The daemon also binds the configured loopback TCP `host`/`port` as a local websocket bridge for Codex Desktop clients, while older websocket-only Codex CLIs use that same address for the managed Codex child. A provider-router experiment listens on `port + 1` with paths like `/agent/claude` or `/agent/opencode`; it speaks Desktop websocket JSON-RPC and dispatches to the selected non-Codex Alleycat bridge. The PWA browser adapter is available behind `alleycat serve --serve-pwa`; it is opt-in and should not be enabled on the production systemd service without explicit confirmation.
+- Current upstream Codex handling prefers Codex's Unix app-server/proxy flow (`codex app-server --listen unix://` plus `codex app-server proxy`). The daemon also binds the configured loopback TCP `host`/`port` as a local websocket bridge for Codex Desktop clients, while older websocket-only Codex CLIs use that same address for the managed Codex child. A provider-router experiment listens on `port + 1` with paths like `/agent/claude` or `/agent/opencode`; it speaks Desktop websocket JSON-RPC and dispatches to the selected non-Codex Alleycat bridge.
+- **PWA browser adapter is part of the production systemd unit.** The unit invokes:
+  ```
+  alleycat serve --serve-pwa --listen 127.0.0.1:5852 --pwa-dir /home/shuv/repos/litter-pwa/apps/web/dist
+  ```
+  Three listeners come up: `127.0.0.1:8390` (codex websocket bridge, from `host`/`port` in `~/.config/alleycat/host.toml`), `127.0.0.1:8391` (provider router), `127.0.0.1:5852` (PWA browser adapter). The PWA flag was originally opt-in for testing in the now-removed `alleycat-fork` sibling repo; that experiment has been merged into the single production unit on this fork. If `--serve-pwa` ever needs to be turned off, edit the unit with `systemctl --user edit --full alleycat.service`.
 - OpenCode is lazily spawned by Alleycat with `opencode serve --port=<auto>` on first paired connection; local standalone `opencode serve` should not be left running unless intentionally testing outside Alleycat.
 - The daemon spawns external CLIs on demand; availability is environment-dependent.
 
@@ -41,30 +46,35 @@ This fork **never** uses `CodexMode::UnixDaemon`, even when the local `codex` bu
 - Operational implication: there is **no codex app-server outside alleycat's cgroup** in steady state. If you see one, it is a regression — kill it, remove `~/.codex/app-server-daemon/app-server.pid` and `~/.codex/app-server-control/app-server-control.sock`, restart alleycat, and investigate the path that bypassed alleycat.
 - The codex CLI wrapper at `~/dotfiles/codex/codex` and the Codex Desktop launcher (`~/repos/codex-desktop-linux/launcher/start.sh.template`) both refuse to start without a healthy alleycat, so the only legitimate path to a codex app-server child is through alleycat.
 
-## Parallel local alleycat instances
+## Single-instance topology
 
-## Parallel local alleycat instances
+As of 2026-05-22, this is the **only** alleycat instance on the machine. The former `~/repos/alleycat-fork` (dnakov upstream, browser-adapter experiment) has been deleted; its `--serve-pwa` browser-adapter feature was merged into this fork's production systemd unit. The sibling-isolation playbook (separate `HOME`, tmux session on `litter-pwa-alleycat.sock`, isolated XDG dirs under `/tmp/litter-pwa-alleycat-home`, port `5851`) is gone — none of those paths exist anymore.
 
-Two distinct alleycat repos run on this machine simultaneously under the same binary name. Always disambiguate before restarting, killing, installing, or editing — they share zero state but share the binary name and several conventions.
+Canonical facts:
 
-| Fact | This repo (shuv1337 fork) | Sibling (dnakov upstream) |
-|---|---|---|
-| Repo path | `/home/shuv/repos/alleycat` | `/home/shuv/repos/alleycat-fork` |
-| Remote | `git@github.com:shuv1337/alleycat.git` (origin), `dnakov/alleycat` (upstream) | `git@github.com:dnakov/alleycat.git` (origin) |
-| Binary in use | `~/.cargo/bin/alleycat` (release, `cargo install`ed from this tree) | `target/debug/alleycat` (in-tree debug build) |
-| Launch | systemd user unit `alleycat.service` | tmux session `alleycat-pwa` on socket `/tmp/tmux-skill-sockets/litter-pwa-alleycat.sock`, window `serve` |
-| Ports | `127.0.0.1:8390` (codex bridge), `127.0.0.1:8391` (provider router) | `127.0.0.1:5851` (`--serve-pwa --pwa-dir .../litter-pwa/apps/web/dist`) |
-| `HOME` / state | `~`, `~/.config/alleycat/`, `~/.local/state/alleycat/` | `/tmp/litter-pwa-alleycat-home/{,.config,.local/state,.run}` (isolated `XDG_CONFIG_HOME`/`XDG_STATE_HOME`/`XDG_RUNTIME_DIR`) |
-| Identify by cgroup | `/user.slice/.../app.slice/alleycat.service` | none (parent is the tmux server PID) |
-| Unique runtime mode | systemd runs plain `serve`; this fork also supports optional `serve --serve-pwa` for browser-adapter testing | tmux runs `serve --serve-pwa --pwa-dir .../litter-pwa/apps/web/dist` |
+| Fact | Value |
+|---|---|
+| Repo path | `/home/shuv/repos/alleycat` |
+| Remote | `git@github.com:shuv1337/alleycat.git` (origin), `dnakov/alleycat` (upstream) |
+| Binary in use | `~/.cargo/bin/alleycat` (release, `cargo install`ed from this tree) |
+| Launch | systemd user unit `alleycat.service` |
+| Listeners | `127.0.0.1:8390` (codex bridge), `127.0.0.1:8391` (provider router), `127.0.0.1:5852` (PWA browser adapter, `--pwa-dir /home/shuv/repos/litter-pwa/apps/web/dist`) |
+| `HOME` / state | `~`, `~/.config/alleycat/`, `~/.local/state/alleycat/` |
+| cgroup | `/user.slice/.../app.slice/alleycat.service` |
 
-Rules:
+Operational rules carried over from the sibling era:
 
-- **Never `pkill alleycat` or blanket-kill by name** — it hits both. Disambiguate by cgroup, `HOME` env (`tr '\0' '\n' < /proc/<pid>/environ | grep HOME`), `cwd`, or unique flags.
-- `systemctl --user restart alleycat.service` restarts only `~/.cargo/bin/alleycat`. That binary is built from **this** repo. Running it from the upstream tree restarts the wrong source.
-- `cargo install --locked --path crates/alleycat` from **either** tree overwrites `~/.cargo/bin/alleycat` and silently hijacks the systemd binary. The upstream sibling is meant to run from `target/debug/`, not installed — don't `cargo install` from there.
-- The sibling holds its own iroh node, relay connection, and `QADv6 NetworkUnreachable` IPv6 warning stream in its own log dir. The noisy warnings are not cross-talk.
-- Sibling control socket lives at `/tmp/litter-pwa-alleycat-home/.run/alleycat-<hash>/control.sock` — not `~/.local/state/alleycat/...`. Running `alleycat status` against the sibling requires `HOME=/tmp/litter-pwa-alleycat-home alleycat status`.
+- `cargo install --locked --path crates/alleycat` from this tree overwrites `~/.cargo/bin/alleycat`, which is what `systemctl --user restart alleycat.service` re-execs. Never `cargo install` from an unrelated alleycat checkout into the same cargo bin without intending to swap the production binary.
+- The QUIC/iroh relays emit a steady stream of `QADv6 NetworkUnreachable` IPv6 warnings into `~/.local/state/alleycat/logs/daemon.log.<date>`. Benign; ignore unless paired with actual connection failures.
+- `pkill alleycat` is safe in this single-instance world but still inferior to `systemctl --user restart alleycat.service`, which preserves restart accounting and rebinds all three listeners cleanly.
+
+## MCP servers on the codex bridge
+
+As of 2026-05-22, **raindrop MCP has been removed** from `~/.codex/config.toml`, `~/.claude.json`, and the `pi-shuv` extensions list (`~/dotfiles/pi/pi-shuv/package.json`). Background: the codex app-server spawned by alleycat was leaking one `raindrop workshop mcp` child per chat session without reaping the previous ones, accumulating 4+ processes per hour and pushing alleycat's RSS to ~2.3 GB (6.6 GB peak) within a single uptime. If raindrop is re-enabled in any agent config, monitor `systemctl --user status alleycat.service` for child accumulation and consider a periodic restart timer.
+
+The standalone `raindrop-workshop.service` user unit was also stopped and disabled (`systemctl --user disable raindrop-workshop.service`) on the same date — it is no longer expected to be running anywhere on this host. If a `raindrop workshop serve` process reappears under `systemd --user`, re-check whether the unit was re-enabled by some other workflow.
+
+If you ever see `raindrop workshop mcp` after this cleanup, it is almost certainly a leftover child of a long-running standalone `codex resume` or `claude` CLI session that started before the config edits and is still holding its stale MCP wiring. It will die when its parent CLI exits, or you can kill it directly.
 
 ## Hermes bridge
 
