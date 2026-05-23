@@ -8,9 +8,10 @@
 //! internals, every spawn is routed through the [`ProcessLauncher`] trait
 //! defined here.
 //!
-//! [`LocalLauncher`] is the default implementation and preserves the daemon's
-//! current behavior bit-for-bit: it wraps `tokio::process::Command` with
-//! `kill_on_drop(true)` so a dropped child doesn't outlive the bridge.
+//! [`LocalLauncher`] is the default implementation. It wraps
+//! `tokio::process::Command` with `kill_on_drop(true)` so a dropped child
+//! doesn't outlive the bridge, and suppresses visible console windows for
+//! detached Windows daemons.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -60,10 +61,13 @@ pub struct ProcessSpec {
     pub program: PathBuf,
     pub args: Vec<OsString>,
     pub cwd: Option<PathBuf>,
-    /// Environment variables to set on the child. These are layered on top of
-    /// the launcher's default environment; each entry overrides any inherited
-    /// value with the same key.
+    /// Environment variables to set on the child. Unless `env_clear` is true,
+    /// these are layered on top of the launcher's default environment; each
+    /// entry overrides any inherited value with the same key.
     pub env: Vec<(OsString, OsString)>,
+    /// Start the child from exactly `env` instead of inheriting the launcher
+    /// process environment first.
+    pub env_clear: bool,
     pub stdin: StdioMode,
     pub stdout: StdioMode,
     pub stderr: StdioMode,
@@ -77,6 +81,7 @@ impl ProcessSpec {
             args: Vec::new(),
             cwd: None,
             env: Vec::new(),
+            env_clear: false,
             role: ProcessRole::Agent,
             stdin: StdioMode::Piped,
             stdout: StdioMode::Piped,
@@ -134,6 +139,9 @@ impl ProcessLauncher for LocalLauncher {
             if let Some(cwd) = &spec.cwd {
                 cmd.current_dir(cwd);
             }
+            if spec.env_clear {
+                cmd.env_clear();
+            }
             for (k, v) in &spec.env {
                 cmd.env(k, v);
             }
@@ -141,10 +149,18 @@ impl ProcessLauncher for LocalLauncher {
             cmd.stdout(spec.stdout.to_std());
             cmd.stderr(spec.stderr.to_std());
             cmd.kill_on_drop(true);
+            #[cfg(windows)]
+            hide_windows_console(&mut cmd);
             let child = cmd.spawn()?;
             Ok(Box::new(LocalChild { inner: child }) as Box<dyn ChildProcess>)
         })
     }
+}
+
+#[cfg(windows)]
+fn hide_windows_console(command: &mut Command) {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
 }
 
 struct LocalChild {

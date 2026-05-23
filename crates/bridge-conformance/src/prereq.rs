@@ -297,9 +297,9 @@ fn has_factory_auth() -> bool {
     let Some(home) = env::var_os("HOME") else {
         return false;
     };
-    PathBuf::from(home)
-        .join(".factory/auth.encrypted")
-        .is_file()
+    let factory_dir = PathBuf::from(home).join(".factory");
+    factory_dir.join("auth.encrypted").is_file()
+        || (factory_dir.join("auth.v2.file").is_file() && factory_dir.join("auth.v2.key").is_file())
 }
 
 fn has_amp_auth() -> bool {

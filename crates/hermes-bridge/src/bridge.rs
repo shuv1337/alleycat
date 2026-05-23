@@ -5,13 +5,13 @@
 //! implemented; unsupported Codex-only features return explicit -32601 errors.
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
-use tokio::sync::broadcast::error::RecvError;
 
 use alleycat_bridge_core::{Bridge, Conn, JsonRpcError};
 use alleycat_codex_proto::account::{
@@ -52,11 +52,7 @@ use alleycat_codex_proto::turn::{TurnInterruptResponse, TurnStartParams, TurnSta
 
 use crate::api_client::{CreateRunRequest, DEFAULT_API_KEY_ENV, HermesApiClient};
 use crate::config::HermesBridgeConfig;
-use crate::event_store::{EventStore, NormalizedHermesEvent};
-use crate::health_cache::HealthCache;
 use crate::index::{HermesBinding, ThreadIndex};
-use crate::run_manager::HermesRunManager;
-use crate::run_state::{HermesRunRecord, HermesTurnStatus, RunStore};
 use crate::state::{ActiveTurn, TurnState};
 
 fn random_hex(len: usize) -> String {
@@ -157,10 +153,6 @@ pub struct HermesBridge {
     state: Arc<TurnState>,
     turns: Arc<Mutex<HashMap<String, Vec<Turn>>>>,
     api_client: Arc<HermesApiClient>,
-    run_store: Arc<RunStore>,
-    event_store: Arc<EventStore>,
-    run_manager: Arc<HermesRunManager>,
-    health_cache: Arc<HealthCache>,
 }
 
 impl HermesBridge {
@@ -174,49 +166,18 @@ impl HermesBridge {
         };
         let api_key = std::env::var(DEFAULT_API_KEY_ENV)
             .or_else(|_| std::env::var("API_SERVER_KEY"))
-            .ok()
-            .or_else(load_api_key_from_dotenv);
-        let state_dir = config.state_dir.as_ref().map(PathBuf::from);
-        let index = state_dir
+            .ok();
+        let index = config
+            .state_dir
             .as_ref()
-            .and_then(|dir| ThreadIndex::open_sync(dir.join("threads.json")).ok())
+            .and_then(|dir| ThreadIndex::open_sync(PathBuf::from(dir).join("threads.json")).ok())
             .unwrap_or_else(ThreadIndex::new_in_memory);
-        let run_store = state_dir
-            .as_ref()
-            .and_then(|dir| RunStore::open_sync(dir.join("runs.json")).ok())
-            .unwrap_or_else(RunStore::new_in_memory);
-        // Mark any orphaned runs from a prior daemon process as Unknown.
-        let _ = run_store.mark_orphans_unknown(epoch_ms());
-        let event_store = state_dir
-            .as_ref()
-            .and_then(|dir| EventStore::open_sync(dir.join("events")).ok())
-            .unwrap_or_else(EventStore::new_in_memory);
-        let api_client = Arc::new(HermesApiClient::new(&api_base, api_key));
-        let run_store = Arc::new(run_store);
-        let event_store = Arc::new(event_store);
-        let run_manager = Arc::new(HermesRunManager::new(
-            Arc::clone(&api_client),
-            Arc::clone(&run_store),
-            Arc::clone(&event_store),
-        ));
-        let health_cache = Arc::new(HealthCache::new(config.health_cache_ttl_ms));
-        tracing::info!(
-            agent = "hermes",
-            api_base = %api_base,
-            state_dir = ?state_dir,
-            mode = ?config.mode,
-            "hermes bridge constructed"
-        );
         Self {
             config,
             index: Arc::new(index),
             state: Arc::new(TurnState::new()),
             turns: Arc::new(Mutex::new(HashMap::new())),
-            api_client,
-            run_store,
-            event_store,
-            run_manager,
-            health_cache,
+            api_client: Arc::new(HermesApiClient::new(&api_base, api_key)),
         }
     }
 
@@ -328,79 +289,12 @@ impl HermesBridge {
     }
 
     fn logged_turns(&self, thread_id: &str) -> Vec<Turn> {
-        // Two sources, merged: in-memory `self.turns` (live during the current
-        // process) and `RunStore` + `EventStore` (durable, survives restart).
-        // Prefer the in-memory representation for entries that exist in both,
-        // because it carries fully-formed thread items already.
-        let mut by_id: std::collections::HashMap<String, Turn> = self
-            .turns
+        self.turns
             .lock()
             .unwrap()
             .get(thread_id)
             .cloned()
             .unwrap_or_default()
-            .into_iter()
-            .map(|t| (t.id.clone(), t))
-            .collect();
-        for record in self.run_store.list_for_thread(thread_id) {
-            if by_id.contains_key(&record.turn_id) {
-                continue;
-            }
-            by_id.insert(
-                record.turn_id.clone(),
-                turn_from_run_record(&record, self.event_store.as_ref()),
-            );
-        }
-        let mut merged: Vec<Turn> = by_id.into_values().collect();
-        merged.sort_by_key(|turn| turn.started_at.unwrap_or(0));
-        merged
-    }
-}
-
-fn turn_from_run_record(record: &HermesRunRecord, event_store: &EventStore) -> Turn {
-    use alleycat_codex_proto::common::{TurnError, TurnStatus};
-    let status = match record.status {
-        HermesTurnStatus::Completed => TurnStatus::Completed,
-        HermesTurnStatus::Failed | HermesTurnStatus::Cancelled => TurnStatus::Failed,
-        HermesTurnStatus::Starting | HermesTurnStatus::Running => TurnStatus::InProgress,
-        HermesTurnStatus::Unknown => TurnStatus::Failed,
-    };
-    let mut items: Vec<ThreadItem> = record.user_items.clone();
-    if let Some(run_id) = record.run_id.as_deref() {
-        if let Ok(events) = event_store.read_all(run_id) {
-            for ev in events {
-                if ev.method == "item/started" || ev.method == "item/completed" {
-                    if let Some(item) = ev.params.get("item").cloned() {
-                        if let Ok(parsed) = serde_json::from_value::<ThreadItem>(item) {
-                            // Replace prior partial of same id with the
-                            // newer (more complete) representation.
-                            let id = parsed.id().to_string();
-                            if let Some(existing_pos) = items.iter().position(|i| i.id() == id) {
-                                items[existing_pos] = parsed;
-                            } else {
-                                items.push(parsed);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Turn {
-        id: record.turn_id.clone(),
-        items,
-        items_view: "full".to_string(),
-        status,
-        error: record.error.clone().map(|message| TurnError {
-            message,
-            codex_error_info: None,
-            additional_details: None,
-        }),
-        started_at: Some(record.created_at),
-        completed_at: record.completed_at,
-        duration_ms: record
-            .completed_at
-            .map(|end| (end - record.created_at).max(0)),
     }
 }
 
@@ -549,7 +443,6 @@ impl HermesBridge {
         if !p.exclude_turns {
             thread.turns = self.logged_turns(&p.thread_id);
         }
-        self.subscribe_active_run(ctx, &binding.thread_id);
         let _ = ctx.notifier().send_notification(
             "thread/started",
             ThreadStartedNotification {
@@ -557,25 +450,6 @@ impl HermesBridge {
             },
         );
         to_value(Self::start_like_response(thread, p.model.or(binding.model)))
-    }
-
-    fn subscribe_active_run(&self, ctx: &Conn, thread_id: &str) {
-        let Some(record) = self.run_store.active_for_thread(thread_id) else {
-            return;
-        };
-        if !matches!(
-            record.status,
-            HermesTurnStatus::Starting | HermesTurnStatus::Running
-        ) {
-            return;
-        }
-        let Some(run_id) = record.run_id.as_deref() else {
-            return;
-        };
-        if !self.run_manager.is_active(run_id) {
-            return;
-        }
-        self.spawn_translator(ctx.clone(), run_id.to_string(), 0);
     }
 
     async fn handle_thread_fork(&self, ctx: &Conn, params: Value) -> Result<Value, JsonRpcError> {
@@ -828,8 +702,7 @@ impl HermesBridge {
                 turn,
             },
         );
-        let user_items = self
-            .emit_user_message(ctx, &thread_id, &turn_id, &p.input)
+        self.emit_user_message(ctx, &thread_id, &turn_id, &p.input)
             .await;
         let text = user_text(&p.input);
         let cwd = p.cwd.as_ref().map(|p| p.to_string_lossy().to_string());
@@ -842,57 +715,22 @@ impl HermesBridge {
             epoch_ms(),
         );
         self.persist_index()?;
-
-        // Persist `Starting` *before* hitting the API. Phase 2.2: durable
-        // state must precede streaming so reconnects never see a turn that
-        // exists in memory only.
-        let now = epoch_ms();
-        let agent_item_id = format!("item_{}", random_hex(8));
-        let starting_record = HermesRunRecord {
-            thread_id: thread_id.clone(),
-            turn_id: turn_id.clone(),
-            hermes_session_id: session_id.clone(),
-            run_id: None,
-            status: HermesTurnStatus::Starting,
-            created_at: now,
-            updated_at: now,
-            completed_at: None,
-            error: None,
-            accumulated_text: String::new(),
-            last_event_seq: None,
-            agent_item_id: Some(agent_item_id.clone()),
-            user_items,
-        };
-        if let Err(err) = self.run_store.upsert(starting_record) {
-            tracing::warn!(error = %err, turn_id = %turn_id, "persist starting run record failed");
-        }
-
         match &self.config.mode {
             crate::config::HermesMode::Api { .. } => {
-                self.dispatch_turn_api(ctx, &thread_id, &turn_id, &session_id, &agent_item_id, &p)
+                self.dispatch_turn_api(ctx, &thread_id, &turn_id, &session_id, &p)
                     .await
             }
             crate::config::HermesMode::Auto { .. } => {
-                let snapshot = self
-                    .health_cache
-                    .get_or_probe(&self.api_client, self.config.health_timeout_ms)
-                    .await;
-                if snapshot.healthy {
-                    self.dispatch_turn_api(
-                        ctx,
-                        &thread_id,
-                        &turn_id,
-                        &session_id,
-                        &agent_item_id,
-                        &p,
-                    )
+                if self
+                    .api_client
+                    .health()
                     .await
+                    .map(|h| h.status == "ok")
+                    .unwrap_or(false)
+                {
+                    self.dispatch_turn_api(ctx, &thread_id, &turn_id, &session_id, &p)
+                        .await
                 } else {
-                    tracing::info!(
-                        agent = "hermes",
-                        reason = ?snapshot.reason,
-                        "hermes auto-mode falling back to CLI"
-                    );
                     self.dispatch_turn_cli(ctx, &thread_id, &turn_id, &p).await
                 }
             }
@@ -911,20 +749,13 @@ impl HermesBridge {
         _ctx: &Conn,
         params: Value,
     ) -> Result<Value, JsonRpcError> {
-        let p: alleycat_codex_proto::turn::TurnInterruptParams = serde_json::from_value(params)
-            .map_err(|e| rpc_error(-32602, format!("Invalid params: {e}")))?;
-        let thread_id = p.thread_id;
+        let thread_id = params.get("threadId").and_then(Value::as_str).unwrap_or("");
         if let Some(active) = self
             .state
-            .remove(&thread_id)
+            .remove(thread_id)
             .and_then(|active| active.run_id)
         {
-            if let Err(err) = self.run_manager.stop(&active).await {
-                tracing::warn!(error = %err, run_id = %active, "hermes stop_run failed");
-            }
-            // The SSE pump will observe `run.cancelled` and finalize via the
-            // normal path. We do not emit terminal frames ourselves here
-            // because doing so would race the pump's normalized events.
+            let _ = self.api_client.stop_run(&active).await;
         }
         to_value(TurnInterruptResponse::default())
     }
@@ -1249,7 +1080,6 @@ impl HermesBridge {
         thread_id: &str,
         turn_id: &str,
         session_id: &str,
-        agent_item_id: &str,
         params: &TurnStartParams,
     ) -> Result<Value, JsonRpcError> {
         let text = user_text(&params.input);
@@ -1272,14 +1102,6 @@ impl HermesBridge {
             Ok(run) => run,
             Err(e) => {
                 let message = format!("Hermes API error: {e}");
-                let now = epoch_ms();
-                let _ = self.run_store.mark_terminal(
-                    turn_id,
-                    HermesTurnStatus::Failed,
-                    Some(message.clone()),
-                    None,
-                    now,
-                );
                 self.emit_turn_completed(ctx, thread_id, turn_id, None, Some(message.clone()))
                     .await;
                 return error_response(-32603, &message);
@@ -1306,77 +1128,180 @@ impl HermesBridge {
             },
         );
 
-        // Persist Running state with the run_id so reconnects can discover
-        // the active run.
-        let updated = match self
-            .run_store
-            .mark_running(turn_id, &run.run_id, epoch_ms())
-        {
-            Ok(Some(record)) => record,
-            Ok(None) => {
-                tracing::warn!(turn_id = %turn_id, "mark_running: no record found; reconstructing");
-                HermesRunRecord {
-                    thread_id: thread_id.to_string(),
-                    turn_id: turn_id.to_string(),
-                    hermes_session_id: session_id.to_string(),
-                    run_id: Some(run.run_id.clone()),
-                    status: HermesTurnStatus::Running,
-                    created_at: epoch_ms(),
-                    updated_at: epoch_ms(),
-                    completed_at: None,
-                    error: None,
-                    accumulated_text: String::new(),
-                    last_event_seq: None,
-                    agent_item_id: Some(agent_item_id.to_string()),
-                    user_items: Vec::new(),
-                }
-            }
-            Err(err) => {
-                tracing::warn!(error = %err, turn_id = %turn_id, "mark_running failed");
-                HermesRunRecord {
-                    thread_id: thread_id.to_string(),
-                    turn_id: turn_id.to_string(),
-                    hermes_session_id: session_id.to_string(),
-                    run_id: Some(run.run_id.clone()),
-                    status: HermesTurnStatus::Running,
-                    created_at: epoch_ms(),
-                    updated_at: epoch_ms(),
-                    completed_at: None,
-                    error: None,
-                    accumulated_text: String::new(),
-                    last_event_seq: None,
-                    agent_item_id: Some(agent_item_id.to_string()),
-                    user_items: Vec::new(),
-                }
-            }
-        };
-
-        let auto_approve = matches!(params.approval_policy.as_ref(), Some(AskForApproval::Never));
-
-        // The run manager owns the single SSE pump. Per-Conn translators
-        // subscribe to a broadcast and forward normalized events as JSON-RPC
-        // notifications. This `Conn`'s subscription replays nothing because
-        // we just created the run.
-        self.run_manager
-            .ensure_run(updated, agent_item_id.to_string(), auto_approve);
-        self.spawn_translator(ctx.clone(), run.run_id.clone(), 0);
-
+        let agent_item_id = format!("item_{}", random_hex(8));
+        self.emit_agent_started(ctx, thread_id, turn_id, &agent_item_id)
+            .await;
         let response_turn = in_progress_turn(turn_id);
+        let auto_approve = matches!(params.approval_policy.as_ref(), Some(AskForApproval::Never));
+        let bridge = self.clone();
+        let ctx = ctx.clone();
+        let thread_id = thread_id.to_string();
+        let turn_id = turn_id.to_string();
+        tokio::spawn(async move {
+            bridge
+                .pump_api_events(
+                    ctx,
+                    thread_id,
+                    turn_id,
+                    agent_item_id,
+                    run.run_id,
+                    auto_approve,
+                )
+                .await;
+        });
         to_value(TurnStartResponse {
             turn: response_turn,
         })
     }
 
-    /// Spawn a per-`Conn` task that forwards normalized run events as
-    /// JSON-RPC notifications. Replays any persisted events with seq >
-    /// `after_seq` first. Exits when the broadcast channel closes (the run
-    /// is terminal) or the connection's notifier rejects (drainer gone).
-    fn spawn_translator(&self, ctx: Conn, run_id: String, after_seq: u64) {
-        let subscription = self.run_manager.subscribe(&run_id, after_seq);
-        let manager = Arc::clone(&self.run_manager);
-        tokio::spawn(async move {
-            translator_loop(ctx, manager, run_id, subscription).await;
-        });
+    async fn pump_api_events(
+        &self,
+        ctx: Conn,
+        thread_id: String,
+        turn_id: String,
+        agent_item_id: String,
+        run_id: String,
+        auto_approve: bool,
+    ) {
+        let mut full_text = String::new();
+        let mut terminal = false;
+        let resp = match self.api_client.events_stream(&run_id).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                let message = format!("Hermes events error: {e}");
+                self.emit_agent_completed(&ctx, &thread_id, &turn_id, &agent_item_id, "")
+                    .await;
+                self.emit_turn_completed(&ctx, &thread_id, &turn_id, None, Some(message))
+                    .await;
+                return;
+            }
+        };
+        let mut body = String::new();
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let bytes = match chunk {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    let message = format!("Hermes SSE error: {e}");
+                    self.emit_agent_completed(
+                        &ctx,
+                        &thread_id,
+                        &turn_id,
+                        &agent_item_id,
+                        &full_text,
+                    )
+                    .await;
+                    self.emit_turn_completed(&ctx, &thread_id, &turn_id, None, Some(message))
+                        .await;
+                    return;
+                }
+            };
+            body.push_str(&String::from_utf8_lossy(&bytes));
+            while let Some(idx) = body.find("\n\n") {
+                let complete = body[..idx + 2].to_string();
+                body = body[idx + 2..].to_string();
+                for event in crate::sse::parse_sse_frames(&complete) {
+                    if let Some(delta) = event.message_delta() {
+                        full_text.push_str(&delta);
+                        self.emit_agent_delta(&ctx, &thread_id, &turn_id, &agent_item_id, &delta)
+                            .await;
+                    } else if let Some(error) = event.terminal_error() {
+                        self.emit_agent_completed(
+                            &ctx,
+                            &thread_id,
+                            &turn_id,
+                            &agent_item_id,
+                            &full_text,
+                        )
+                        .await;
+                        self.emit_turn_completed(
+                            &ctx,
+                            &thread_id,
+                            &turn_id,
+                            None,
+                            Some(format!("Hermes API error: {error}")),
+                        )
+                        .await;
+                        return;
+                    } else if event.event == "approval.request" {
+                        if auto_approve {
+                            if let Err(e) = self.api_client.approve_run_once(&run_id).await {
+                                let message = format!("Hermes approval error: {e}");
+                                self.emit_agent_completed(
+                                    &ctx,
+                                    &thread_id,
+                                    &turn_id,
+                                    &agent_item_id,
+                                    &full_text,
+                                )
+                                .await;
+                                self.emit_turn_completed(
+                                    &ctx,
+                                    &thread_id,
+                                    &turn_id,
+                                    None,
+                                    Some(message),
+                                )
+                                .await;
+                                return;
+                            }
+                        } else if !auto_approve {
+                            self.emit_agent_completed(
+                                &ctx,
+                                &thread_id,
+                                &turn_id,
+                                &agent_item_id,
+                                &full_text,
+                            )
+                            .await;
+                            self.emit_turn_completed(
+                                &ctx,
+                                &thread_id,
+                                &turn_id,
+                                None,
+                                Some("Hermes approval required".to_string()),
+                            )
+                            .await;
+                            return;
+                        }
+                    } else if event.is_terminal_success() {
+                        if full_text.is_empty()
+                            && let Some(output) = event.data.get("output").and_then(Value::as_str)
+                        {
+                            full_text.push_str(output);
+                            self.emit_agent_delta(
+                                &ctx,
+                                &thread_id,
+                                &turn_id,
+                                &agent_item_id,
+                                output,
+                            )
+                            .await;
+                        }
+                        terminal = true;
+                    }
+                }
+                if terminal {
+                    break;
+                }
+            }
+            if terminal {
+                break;
+            }
+        }
+        if !terminal && !body.trim().is_empty() {
+            for event in crate::sse::parse_sse_frames(&body) {
+                if let Some(delta) = event.message_delta() {
+                    full_text.push_str(&delta);
+                    self.emit_agent_delta(&ctx, &thread_id, &turn_id, &agent_item_id, &delta)
+                        .await;
+                }
+            }
+        }
+        self.emit_agent_completed(&ctx, &thread_id, &turn_id, &agent_item_id, &full_text)
+            .await;
+        self.emit_turn_completed(&ctx, &thread_id, &turn_id, Some(&full_text), None)
+            .await;
     }
 
     async fn dispatch_turn_cli(
@@ -1400,39 +1325,10 @@ impl HermesBridge {
             .cwd
             .clone()
             .or_else(|| binding.and_then(|b| b.cwd.map(PathBuf::from)));
-        tracing::info!(
-            agent = "hermes",
-            thread_id = %thread_id,
-            turn_id = %turn_id,
-            bin = %bin,
-            session_id = ?session_id,
-            "hermes CLI fallback dispatch (synthetic single-completion path)"
-        );
-        let started = std::time::Instant::now();
-        let result =
-            crate::cli_adapter::run_hermes_cli(&bin, &text, session_id.as_deref(), cwd.as_ref())
-                .await;
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-        match result {
+        match crate::cli_adapter::run_hermes_cli(&bin, &text, session_id.as_deref(), cwd.as_ref())
+            .await
+        {
             Ok(output) => {
-                tracing::info!(
-                    agent = "hermes",
-                    thread_id = %thread_id,
-                    turn_id = %turn_id,
-                    bin = %bin,
-                    elapsed_ms,
-                    output_chars = output.chars().count(),
-                    "hermes CLI fallback completed"
-                );
-                // Persist a terminal record so post-restart `thread/read`
-                // can show the CLI-fallback turn.
-                let _ = self.run_store.mark_terminal(
-                    turn_id,
-                    HermesTurnStatus::Completed,
-                    None,
-                    Some(output.clone()),
-                    epoch_ms(),
-                );
                 self.emit_synthetic_completion(ctx, thread_id, turn_id, &output)
                     .await;
                 to_value(TurnStartResponse {
@@ -1440,26 +1336,15 @@ impl HermesBridge {
                 })
             }
             Err(e) => {
-                let message = format!("Hermes CLI error: {e}");
-                tracing::warn!(
-                    agent = "hermes",
-                    thread_id = %thread_id,
-                    turn_id = %turn_id,
-                    bin = %bin,
-                    elapsed_ms,
-                    error = %e,
-                    "hermes CLI fallback failed"
-                );
-                let _ = self.run_store.mark_terminal(
+                self.emit_turn_completed(
+                    ctx,
+                    thread_id,
                     turn_id,
-                    HermesTurnStatus::Failed,
-                    Some(message.clone()),
                     None,
-                    epoch_ms(),
-                );
-                self.emit_turn_completed(ctx, thread_id, turn_id, None, Some(message.clone()))
-                    .await;
-                error_response(-32603, &message)
+                    Some(format!("Hermes CLI error: {e}")),
+                )
+                .await;
+                error_response(-32603, &format!("Hermes CLI error: {e}"))
             }
         }
     }
@@ -1470,13 +1355,12 @@ impl HermesBridge {
         thread_id: &str,
         turn_id: &str,
         input: &[UserInput],
-    ) -> Vec<ThreadItem> {
+    ) {
         let item_id = format!("item_{}", random_hex(8));
         let item = ThreadItem::UserMessage {
             id: item_id,
             content: input.to_vec(),
         };
-        let persisted_item = item.clone();
         self.push_logged_item(thread_id, turn_id, item.clone());
         let _ = ctx.notifier().send_notification(
             "item/started",
@@ -1496,7 +1380,6 @@ impl HermesBridge {
                 parent_item_id: None,
             },
         );
-        vec![persisted_item]
     }
 
     async fn emit_agent_started(&self, ctx: &Conn, thread_id: &str, turn_id: &str, item_id: &str) {
@@ -1620,154 +1503,4 @@ impl HermesBridge {
         self.emit_turn_completed(ctx, thread_id, turn_id, Some(text), None)
             .await;
     }
-}
-
-/// Per-`Conn` translator: pumps normalized run events from the manager's
-/// broadcast into JSON-RPC notifications on the connection. Replays any
-/// persisted events with `seq > after_seq` first, then live-tails the
-/// broadcast until it closes (terminal) or the receiver lags.
-async fn translator_loop(
-    ctx: Conn,
-    manager: Arc<HermesRunManager>,
-    run_id: String,
-    mut subscription: crate::run_manager::RunSubscription,
-) {
-    // Replay persisted events first. Note: replay does NOT re-prompt the
-    // client for approval requests — those are stateful interactions and
-    // are forwarded as plain notifications during replay so reconnecting
-    // clients can show the historical event but the request/response
-    // contract is owned by the original prompt (or the in-flight one).
-    let mut last_seq: u64 = 0;
-    for event in subscription.replay.drain(..) {
-        last_seq = last_seq.max(event.seq);
-        if let Err(err) = forward_event(&ctx, &event) {
-            tracing::debug!(run_id = %run_id, error = ?err, "hermes translator: notifier closed during replay");
-            return;
-        }
-    }
-    // Live-tail.
-    loop {
-        match subscription.rx.recv().await {
-            Ok(event) => {
-                // Skip duplicates that came in between replay snapshot and
-                // first live frame (best-effort).
-                if event.seq <= last_seq {
-                    continue;
-                }
-                last_seq = event.seq;
-                if event.method == "hermes/approvalRequest" {
-                    handle_approval_request(&ctx, &manager, &run_id, &event).await;
-                    continue;
-                }
-                if let Err(err) = forward_event(&ctx, &event) {
-                    tracing::debug!(run_id = %run_id, error = ?err, "hermes translator: notifier closed");
-                    return;
-                }
-            }
-            Err(RecvError::Lagged(skipped)) => {
-                tracing::warn!(
-                    run_id = %run_id,
-                    skipped,
-                    "hermes translator: broadcast lagged; subscriber lost frames"
-                );
-                // Continue; subsequent reads from broadcast will return the
-                // newest available frames. The persisted EventStore is the
-                // authoritative replay source if a fresh reattach happens.
-                continue;
-            }
-            Err(RecvError::Closed) => {
-                tracing::debug!(run_id = %run_id, "hermes translator: broadcast closed (run terminal)");
-                return;
-            }
-        }
-    }
-}
-
-fn forward_event(ctx: &Conn, event: &NormalizedHermesEvent) -> Result<(), JsonRpcError> {
-    ctx.notifier()
-        .send_notification(event.method.clone(), event.params.clone())
-        .map_err(|err| rpc_error(-32603, format!("forward event: {err}")))
-}
-
-/// Maximum time to wait for the user to answer an approval prompt before
-/// giving up. The session machinery still replays the outstanding request to
-/// any reattaching client during this window, so a brief network drop does
-/// not auto-deny.
-const APPROVAL_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-
-async fn handle_approval_request(
-    ctx: &Conn,
-    manager: &Arc<HermesRunManager>,
-    run_id: &str,
-    event: &NormalizedHermesEvent,
-) {
-    // Forward the same `hermes/approvalRequest` as a server→client request.
-    // The session pending/outstanding tables ensure reattach within the
-    // pending grace replays the prompt, so a flaky client can still answer.
-    let response = match ctx
-        .notifier()
-        .request(
-            event.method.clone(),
-            event.params.clone(),
-            APPROVAL_REQUEST_TIMEOUT,
-        )
-        .await
-    {
-        Ok(value) => value,
-        Err(err) => {
-            tracing::warn!(run_id = %run_id, error = ?err, "hermes approval request failed; defaulting to deny");
-            // Fall back to deny if no client could answer.
-            let _ = manager
-                .submit_approval(run_id, crate::api_client::ApprovalChoice::Deny, false)
-                .await;
-            return;
-        }
-    };
-    let choice = parse_approval_choice(&response).unwrap_or_else(|| {
-        tracing::warn!(run_id = %run_id, response = ?response, "hermes approval response unparseable; defaulting to deny");
-        crate::api_client::ApprovalChoice::Deny
-    });
-    let resolve_all = response
-        .get("resolveAll")
-        .or_else(|| response.get("resolve_all"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if let Err(err) = manager.submit_approval(run_id, choice, resolve_all).await {
-        tracing::warn!(run_id = %run_id, error = %err, choice = choice.as_str(), "hermes approval submit failed");
-    }
-}
-
-fn parse_approval_choice(value: &Value) -> Option<crate::api_client::ApprovalChoice> {
-    use crate::api_client::ApprovalChoice;
-    let raw = value.get("choice").and_then(Value::as_str)?;
-    let lowered = raw.trim().to_ascii_lowercase();
-    Some(match lowered.as_str() {
-        "once" | "approve" | "approved" | "allow" => ApprovalChoice::Once,
-        "session" => ApprovalChoice::Session,
-        "always" => ApprovalChoice::Always,
-        "deny" | "reject" | "denied" => ApprovalChoice::Deny,
-        _ => return None,
-    })
-}
-
-/// Best-effort fallback: read `API_SERVER_KEY=` from `~/.hermes/.env` when
-/// no env var is set. Silent on any error — the env-var path is the primary.
-fn load_api_key_from_dotenv() -> Option<String> {
-    let dotenv = directories::BaseDirs::new()?
-        .home_dir()
-        .join(".hermes/.env");
-    let text = std::fs::read_to_string(dotenv).ok()?;
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('#') || trimmed.is_empty() {
-            continue;
-        }
-        if let Some(rest) = trimmed.strip_prefix("API_SERVER_KEY=") {
-            let value = rest.trim_matches(|c: char| c == '"' || c == '\'').trim();
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
-        }
-    }
-    None
 }

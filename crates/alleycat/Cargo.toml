@@ -20,6 +20,10 @@ path = "src/lib.rs"
 name = "alleycat"
 path = "src/main.rs"
 
+[[bin]]
+name = "alleycat-startup"
+path = "src/bin/alleycat-startup.rs"
+
 [dependencies]
 alleycat-acp-bridge = { workspace = true }
 alleycat-amp-bridge = { workspace = true }
