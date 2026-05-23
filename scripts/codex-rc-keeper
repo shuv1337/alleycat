@@ -1,0 +1,461 @@
+#!/usr/bin/env python3
+"""Keep Codex app-server remote control enabled.
+
+This speaks Codex app-server JSON-RPC as WebSocket text frames over the Unix
+control socket. It intentionally uses only the Python standard library so the
+installed systemd user service has no packaging dependency.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import json
+import logging
+import os
+import select
+import socket
+import struct
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+
+GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+DEFAULT_SOCKET = Path.home() / ".codex/app-server-control/app-server-control.sock"
+DEFAULT_AUTH = Path.home() / ".codex/auth.json"
+
+
+class WebSocketError(RuntimeError):
+    pass
+
+
+class JsonRpcError(RuntimeError):
+    pass
+
+
+class UnixWebSocket:
+    def __init__(self, socket_path: Path) -> None:
+        self.socket_path = socket_path
+        self.sock: socket.socket | None = None
+
+    def __enter__(self) -> "UnixWebSocket":
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(10)
+        sock.connect(str(self.socket_path))
+        self.sock = sock
+        self._handshake()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            finally:
+                self.sock = None
+
+    def _handshake(self) -> None:
+        assert self.sock is not None
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        request = (
+            "GET /rpc HTTP/1.1\r\n"
+            "Host: codex-app-server.localhost\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        ).encode("ascii")
+        self.sock.sendall(request)
+        response = self._read_until(b"\r\n\r\n")
+        head, _, _body = response.partition(b"\r\n\r\n")
+        lines = head.decode("iso-8859-1").split("\r\n")
+        if not lines or " 101 " not in lines[0]:
+            raise WebSocketError(f"websocket upgrade failed: {lines[0] if lines else '<empty>'}")
+        headers: dict[str, str] = {}
+        for line in lines[1:]:
+            if ":" in line:
+                name, value = line.split(":", 1)
+                headers[name.strip().lower()] = value.strip()
+        expected = base64.b64encode(hashlib.sha1((key + GUID).encode("ascii")).digest()).decode(
+            "ascii"
+        )
+        if headers.get("sec-websocket-accept") != expected:
+            raise WebSocketError("websocket upgrade returned invalid Sec-WebSocket-Accept")
+
+    def _read_until(self, marker: bytes) -> bytes:
+        assert self.sock is not None
+        data = b""
+        while marker not in data:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise EOFError("socket closed during websocket handshake")
+            data += chunk
+        return data
+
+    def send_json(self, message: dict[str, Any]) -> None:
+        payload = json.dumps(message, separators=(",", ":")).encode("utf-8")
+        self._send_frame(0x1, payload)
+
+    def _send_frame(self, opcode: int, payload: bytes) -> None:
+        assert self.sock is not None
+        mask = os.urandom(4)
+        header = bytearray([0x80 | opcode])
+        length = len(payload)
+        if length < 126:
+            header.append(0x80 | length)
+        elif length < 65536:
+            header.append(0x80 | 126)
+            header.extend(struct.pack("!H", length))
+        else:
+            header.append(0x80 | 127)
+            header.extend(struct.pack("!Q", length))
+        masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+        self.sock.sendall(bytes(header) + mask + masked)
+
+    def recv_json(self, timeout: float | None) -> dict[str, Any] | None:
+        while True:
+            frame = self._recv_frame(timeout)
+            if frame is None:
+                return None
+            opcode, payload = frame
+            if opcode == 0x8:
+                raise EOFError("websocket close frame received")
+            if opcode == 0x9:
+                self._send_frame(0xA, payload)
+                continue
+            if opcode == 0xA:
+                continue
+            if opcode not in (0x1, 0x2):
+                continue
+            return json.loads(payload.decode("utf-8"))
+
+    def _recv_frame(self, timeout: float | None) -> tuple[int, bytes] | None:
+        assert self.sock is not None
+        if timeout is not None:
+            readable, _, _ = select.select([self.sock], [], [], max(timeout, 0))
+            if not readable:
+                return None
+        first = self._read_exact(2)
+        opcode = first[0] & 0x0F
+        masked = bool(first[1] & 0x80)
+        length = first[1] & 0x7F
+        if length == 126:
+            length = struct.unpack("!H", self._read_exact(2))[0]
+        elif length == 127:
+            length = struct.unpack("!Q", self._read_exact(8))[0]
+        mask = self._read_exact(4) if masked else b""
+        payload = self._read_exact(length)
+        if masked:
+            payload = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+        return opcode, payload
+
+    def _read_exact(self, length: int) -> bytes:
+        assert self.sock is not None
+        data = b""
+        while len(data) < length:
+            chunk = self.sock.recv(length - len(data))
+            if not chunk:
+                raise EOFError("socket closed while reading websocket frame")
+            data += chunk
+        return data
+
+
+class Keeper:
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.args = args
+        self.next_id = 1
+        self.status: str | None = None
+        self.status_updated_at = 0.0
+        self.server_name: str | None = None
+        self.environment_id: str | None = None
+
+    def run_forever(self) -> int:
+        while True:
+            try:
+                self.run_connected()
+                if self.args.once:
+                    return 0
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:  # noqa: BLE001 - top-level service loop logs all failures.
+                logging.warning("connection cycle failed: %s", exc)
+                if self.args.once:
+                    return 1
+                time.sleep(self.args.reconnect_delay)
+
+    def run_connected(self) -> None:
+        self.wait_for_socket()
+        with UnixWebSocket(self.args.socket) as ws:
+            self.reset_status()
+            logging.info("connected websocket over %s", self.args.socket)
+            self.initialize(ws)
+            self.read_until_initial_status(ws)
+            self.ensure_enabled(ws, reason="startup")
+            if self.args.once:
+                self.read_for(ws, self.args.post_enable_wait)
+                self.log_status("once complete")
+                return
+            while True:
+                self.read_for(ws, self.args.interval)
+                self.ensure_enabled(ws, reason="periodic")
+
+    def reset_status(self) -> None:
+        self.status = None
+        self.status_updated_at = 0.0
+        self.server_name = None
+        self.environment_id = None
+
+    def wait_for_socket(self) -> None:
+        deadline = time.monotonic() + self.args.socket_wait
+        while True:
+            if self.args.socket.exists():
+                return
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"timed out waiting for {self.args.socket}")
+            time.sleep(1)
+
+    def initialize(self, ws: UnixWebSocket) -> None:
+        request_id = self.send_request(
+            ws,
+            "initialize",
+            {
+                "clientInfo": {
+                    "name": "codex-rc-keeper",
+                    "title": "Codex Remote-Control Keeper",
+                    "version": "0.1.0",
+                },
+                "capabilities": {"experimentalApi": True},
+            },
+        )
+        response = self.wait_for_response(ws, request_id, timeout=10)
+        logging.info(
+            "initialized app-server userAgent=%s codexHome=%s",
+            response.get("userAgent"),
+            response.get("codexHome"),
+        )
+        self.send_notification(ws, "initialized", {})
+
+    def read_until_initial_status(self, ws: UnixWebSocket) -> None:
+        deadline = time.monotonic() + self.args.initial_status_wait
+        while self.status is None and time.monotonic() < deadline:
+            self.read_one(ws, timeout=deadline - time.monotonic())
+        self.log_status("initial status")
+
+    def read_for(self, ws: UnixWebSocket, duration: float) -> None:
+        deadline = time.monotonic() + duration
+        while time.monotonic() < deadline:
+            self.read_one(ws, timeout=min(1, deadline - time.monotonic()))
+
+    def read_one(self, ws: UnixWebSocket, timeout: float | None) -> dict[str, Any] | None:
+        message = ws.recv_json(timeout)
+        if message is None:
+            return None
+        if "method" in message and "id" in message:
+            self.handle_server_request(ws, message)
+        elif "method" in message:
+            self.handle_notification(message)
+        return message
+
+    def handle_notification(self, message: dict[str, Any]) -> None:
+        method = message.get("method")
+        if method != "remoteControl/status/changed":
+            logging.debug("notification method=%s", method)
+            return
+        params = message.get("params") or {}
+        self.status = params.get("status")
+        self.server_name = params.get("serverName")
+        self.environment_id = params.get("environmentId")
+        self.status_updated_at = time.monotonic()
+        self.log_status("status changed")
+
+    def handle_server_request(self, ws: UnixWebSocket, message: dict[str, Any]) -> None:
+        method = message.get("method")
+        request_id = message.get("id")
+        params = message.get("params") or {}
+        if method == "account/chatgptAuthTokens/refresh":
+            logging.warning(
+                "received auth refresh request reason=%s previousAccountId=%s",
+                params.get("reason"),
+                params.get("previousAccountId"),
+            )
+            result = self.auth_refresh_response()
+            ws.send_json({"jsonrpc": "2.0", "id": request_id, "result": result})
+            logging.info(
+                "answered auth refresh request accountId=%s planType=%s",
+                result["chatgptAccountId"],
+                result["chatgptPlanType"],
+            )
+            return
+        if method == "attestation/generate":
+            logging.error("attestation requested params=%s", redacted_json(params))
+            ws.send_json(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {
+                        "code": -32000,
+                        "message": "codex-rc-keeper does not provide attestation",
+                    },
+                }
+            )
+            raise RuntimeError("attestation/generate requested; stopping for blocker evidence")
+        logging.warning("unsupported server request method=%s params=%s", method, redacted_json(params))
+        ws.send_json(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {"code": -32601, "message": f"unsupported request {method}"},
+            }
+        )
+
+    def auth_refresh_response(self) -> dict[str, Any]:
+        data = json.loads(self.args.auth.read_text())
+        tokens = data.get("tokens") or {}
+        access_token = tokens.get("access_token")
+        account_id = tokens.get("account_id")
+        if not access_token or not account_id:
+            raise RuntimeError(f"{self.args.auth} lacks tokens.access_token or tokens.account_id")
+        return {
+            "accessToken": access_token,
+            "chatgptAccountId": account_id,
+            "chatgptPlanType": None,
+        }
+
+    def ensure_enabled(self, ws: UnixWebSocket, reason: str) -> None:
+        healthy = self.is_healthy()
+        stale = self.is_stale()
+        if healthy and not stale:
+            self.log_status(f"{reason}: healthy")
+            return
+        why = self.unhealthy_reason(stale)
+        if self.args.dry_run_enable:
+            logging.info("dry-run: would call remoteControl/enable reason=%s", why)
+            return
+        logging.info("calling remoteControl/enable reason=%s", why)
+        request_id = self.send_request(ws, "remoteControl/enable", None)
+        result = self.wait_for_response(ws, request_id, timeout=30)
+        if "status" in result:
+            self.status = result.get("status")
+            self.server_name = result.get("serverName", self.server_name)
+            self.environment_id = result.get("environmentId", self.environment_id)
+            self.status_updated_at = time.monotonic()
+        self.log_status("enable response")
+
+    def wait_for_response(self, ws: UnixWebSocket, request_id: int, timeout: float) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"timed out waiting for response id={request_id}")
+            message = self.read_one(ws, timeout=remaining)
+            if message is None:
+                continue
+            if message.get("id") != request_id:
+                continue
+            if "error" in message:
+                raise JsonRpcError(redacted_json(message["error"]))
+            result = message.get("result")
+            if not isinstance(result, dict):
+                return {}
+            return result
+
+    def send_request(self, ws: UnixWebSocket, method: str, params: Any) -> int:
+        request_id = self.next_id
+        self.next_id += 1
+        message: dict[str, Any] = {"jsonrpc": "2.0", "id": request_id, "method": method}
+        if params is not None:
+            message["params"] = params
+        ws.send_json(message)
+        return request_id
+
+    def send_notification(self, ws: UnixWebSocket, method: str, params: Any) -> None:
+        message: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            message["params"] = params
+        ws.send_json(message)
+
+    def is_healthy(self) -> bool:
+        if self.status == "connected":
+            return True
+        if self.status == "connecting":
+            return (time.monotonic() - self.status_updated_at) < self.args.connecting_grace
+        return False
+
+    def is_stale(self) -> bool:
+        if self.status_updated_at == 0:
+            return True
+        return (time.monotonic() - self.status_updated_at) >= self.args.stale_after
+
+    def unhealthy_reason(self, stale: bool) -> str:
+        if self.status is None:
+            return "missing-status"
+        if stale:
+            return f"stale-status:{self.status}"
+        return f"status:{self.status}"
+
+    def log_status(self, prefix: str) -> None:
+        age = None if self.status_updated_at == 0 else round(time.monotonic() - self.status_updated_at, 1)
+        logging.info(
+            "%s status=%s serverName=%s environmentId=%s age=%s",
+            prefix,
+            self.status,
+            self.server_name,
+            self.environment_id,
+            age,
+        )
+
+
+def redacted_json(value: Any) -> str:
+    def redact(item: Any) -> Any:
+        if isinstance(item, dict):
+            redacted: dict[str, Any] = {}
+            for key, nested in item.items():
+                if any(token in key.lower() for token in ("token", "secret", "authorization")):
+                    redacted[key] = "<redacted>"
+                else:
+                    redacted[key] = redact(nested)
+            return redacted
+        if isinstance(item, list):
+            return [redact(nested) for nested in item]
+        return item
+
+    return json.dumps(redact(value), sort_keys=True)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--socket", type=Path, default=DEFAULT_SOCKET)
+    parser.add_argument("--auth", type=Path, default=DEFAULT_AUTH)
+    parser.add_argument("--once", action="store_true", help="run one status/enable pass and exit")
+    parser.add_argument(
+        "--dry-run-enable",
+        action="store_true",
+        help="log when enable would be called without sending remoteControl/enable",
+    )
+    parser.add_argument("--interval", type=float, default=30)
+    parser.add_argument("--stale-after", type=float, default=300)
+    parser.add_argument("--connecting-grace", type=float, default=120)
+    parser.add_argument("--socket-wait", type=float, default=60)
+    parser.add_argument("--initial-status-wait", type=float, default=3)
+    parser.add_argument("--post-enable-wait", type=float, default=3)
+    parser.add_argument("--reconnect-delay", type=float, default=5)
+    parser.add_argument("--verbose", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+    try:
+        return Keeper(args).run_forever()
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

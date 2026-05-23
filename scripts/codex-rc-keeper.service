@@ -1,0 +1,14 @@
+[Unit]
+Description=Codex remote-control keeper
+Wants=alleycat.service
+After=alleycat.service
+
+[Service]
+Type=simple
+ExecStart=/home/shuv/.local/bin/codex-rc-keeper
+Restart=on-failure
+RestartSec=10s
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

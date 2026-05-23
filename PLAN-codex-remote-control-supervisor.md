@@ -2,9 +2,9 @@
 
 **Goal:** Keep `shuvdev` continuously available as a ChatGPT remote-connected device with no manual sidecar, by supervising the outbound remote-control WebSocket on the alleycat-managed `codex app-server` child.
 
-**Status:** Plan only. Not implemented.
-**Owner:** TBD
-**Last updated:** 2026-05-22
+**Status:** T1 implemented, installed, and enabled locally. Under 24h observation before any push or T2 work.
+**Owner:** local alleycat operator
+**Last updated:** 2026-05-23
 
 ---
 
@@ -50,8 +50,10 @@ A small process that:
 
 ### Tier 1 — Standalone script (today)
 
-- File: `~/.local/bin/codex-rc-keeper` (Python, stdlib only).
-- Systemd user unit: `~/.config/systemd/user/codex-rc-keeper.service`
+- Repo source: `scripts/codex-rc-keeper`; installed file:
+  `~/.local/bin/codex-rc-keeper` (Python, stdlib only).
+- Repo unit template: `scripts/codex-rc-keeper.service`; installed systemd
+  user unit: `~/.config/systemd/user/codex-rc-keeper.service`
   - `After=alleycat.service`
   - `Wants=alleycat.service`
   - `Restart=on-failure`
@@ -72,7 +74,8 @@ A small process that:
     `attestation/generate` anyway, stop and document the exact request as a
     blocker.
   - On socket disconnect: log, sleep 5s, reconnect.
-- Log to journald via stdout. Watch with `journalctl --user -fu codex-rc-keeper`.
+- Log to journald via stdout. Watch with
+  `journalctl --user -fu codex-rc-keeper.service`.
 - Success criteria: `shuvdev` stays visible in ChatGPT app for >24h across at least 2 `systemctl --user restart alleycat.service` cycles.
 
 ### Tier 2 — Native alleycat integration (after T1 proves the concept)
@@ -100,21 +103,25 @@ A small process that:
    refresh requests mean the token is actually stale and should be reported as
    a blocker.
 3. **Upstream churn.** `remote_control` feature flag is marked "removed" in `codex features list`. The JSON-RPC methods and sqlite table are still present in the current binary, but upstream may yank the whole flow. If T2 is shipped before that happens, we own the breakage. Mitigation: keep T1 in shape as a fallback, don't bet on T2 surviving major codex upgrades without re-validation.
-4. **Single-client semantics.** Currently the unix socket has one connected client (alleycat's own `app-server proxy` child). Need to confirm that a second concurrent client (the supervisor) is accepted without disrupting the existing session. Probe in T1 step 1.
-5. **`codex-tui.log` is 112 GB.** Unrelated to this plan but discovered during recon. Rotate before any restart-heavy work to free disk + speed up future probes.
+4. **Single-client semantics.** Confirmed during T1: the unix socket accepts the
+   keeper as an additional initialized WebSocket client without disrupting the
+   existing alleycat/proxy session.
+5. **`codex-tui.log` was huge.** It was truncated on 2026-05-23 before
+   restart-heavy validation.
 
 ---
 
 ## Tasks (T1)
 
-- [ ] Rotate or truncate `~/.codex/log/codex-tui.log` (separate, do before next alleycat restart).
-- [ ] Write `~/.local/bin/codex-rc-keeper` (Python, stdlib only).
-- [ ] Validate WebSocket-over-UDS handshake against the live socket (HTTP 101 → initialize → initialized → initial status notification).
-- [ ] Confirm whether `remoteControl/enable` works without extra attestation.
-- [ ] Write `~/.config/systemd/user/codex-rc-keeper.service`.
-- [ ] `systemctl --user daemon-reload && systemctl --user enable --now codex-rc-keeper.service`.
-- [ ] Watch device appear in ChatGPT app; restart alleycat; confirm device comes back automatically.
-- [ ] Document final state in `AGENTS.md` under a new "Remote control supervisor" section.
+- [x] Rotate or truncate `~/.codex/log/codex-tui.log` (separate, do before next alleycat restart).
+- [x] Write `scripts/codex-rc-keeper` and install it to `~/.local/bin/codex-rc-keeper` (Python, stdlib only).
+- [x] Validate WebSocket-over-UDS handshake against the live socket (HTTP 101 -> initialize -> initialized -> initial status notification).
+- [x] Confirm `remoteControl/enable` works without extra attestation.
+- [x] Write `scripts/codex-rc-keeper.service` and install it to `~/.config/systemd/user/codex-rc-keeper.service`.
+- [x] `systemctl --user daemon-reload && systemctl --user enable --now codex-rc-keeper.service`.
+- [x] Restart alleycat and confirm the keeper reconnects and returns remote control to `connected`.
+- [x] Document final state in `AGENTS.md` under "Codex remote-control keeper".
+- [ ] Observe for 24h and at least two alleycat restart cycles before push or T2.
 
 ## Tasks (T2 — only after T1 has run stable for ≥24h)
 

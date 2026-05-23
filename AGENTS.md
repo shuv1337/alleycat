@@ -46,6 +46,29 @@ This fork **never** uses `CodexMode::UnixDaemon`, even when the local `codex` bu
 - Operational implication: there is **no codex app-server outside alleycat's cgroup** in steady state. If you see one, it is a regression — kill it, remove `~/.codex/app-server-daemon/app-server.pid` and `~/.codex/app-server-control/app-server-control.sock`, restart alleycat, and investigate the path that bypassed alleycat.
 - The codex CLI wrapper at `~/dotfiles/codex/codex` and the Codex Desktop launcher (`~/repos/codex-desktop-linux/launcher/start.sh.template`) both refuse to start without a healthy alleycat, so the only legitimate path to a codex app-server child is through alleycat.
 
+### Codex remote-control keeper
+
+T1 remote-control supervision is installed as a standalone user service, not native Rust alleycat code yet.
+
+- Repo source: `scripts/codex-rc-keeper`; installed script: `~/.local/bin/codex-rc-keeper`.
+- Repo unit template: `scripts/codex-rc-keeper.service`; installed unit: `~/.config/systemd/user/codex-rc-keeper.service`.
+- The unit is `Wants=alleycat.service`, `After=alleycat.service`, `Restart=on-failure`, and logs to journald through stdout/stderr.
+- Transport is WebSocket-over-UDS to `~/.codex/app-server-control/app-server-control.sock` using an HTTP Upgrade handshake. JSON-RPC messages are WebSocket text frames, not raw `Content-Length:` frames.
+- On each connection the keeper sends `initialize` and `initialized`, consumes `remoteControl/status/changed`, and calls `remoteControl/enable` when status is disabled, errored, missing, or stale. The default health loop is 30s; stale connected status is refreshed after 300s.
+- On socket disconnect, usually from `systemctl --user restart alleycat.service`, the keeper reconnects to the respawned codex app-server and re-enables remote control from a fresh status snapshot.
+- If app-server sends `account/chatgptAuthTokens/refresh`, the keeper answers from `~/.codex/auth.json` without logging token values. It does not opt into attestation; any unexpected `attestation/generate` request is a blocker and should be investigated from the keeper journal.
+
+Useful commands:
+
+```bash
+systemctl --user status codex-rc-keeper.service
+journalctl --user -fu codex-rc-keeper.service
+systemctl --user restart codex-rc-keeper.service
+scripts/codex-rc-keeper --once --dry-run-enable
+```
+
+Validation on 2026-05-23: the keeper was installed, enabled, and started; `~/.codex/log/codex-tui.log` was truncated before restart-heavy testing; an alleycat restart at 2026-05-23 09:39:13 was followed by keeper reconnect and `remoteControl/enable`, reaching `connected` at 2026-05-23 09:39:29.988. Do not push this branch or start T2/native Rust integration until the T1 service has stayed green for 24 hours and survived at least two alleycat restart cycles.
+
 ## Single-instance topology
 
 As of 2026-05-22, this is the **only** alleycat instance on the machine. The former `~/repos/alleycat-fork` (dnakov upstream, browser-adapter experiment) has been deleted; its `--serve-pwa` browser-adapter feature was merged into this fork's production systemd unit. The sibling-isolation playbook (separate `HOME`, tmux session on `litter-pwa-alleycat.sock`, isolated XDG dirs under `/tmp/litter-pwa-alleycat-home`, port `5851`) is gone — none of those paths exist anymore.
