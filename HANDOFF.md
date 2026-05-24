@@ -78,7 +78,22 @@ T2 local validation already run successfully:
 ```bash
 cargo test -p alleycat-codex-remote-control
 cargo test -p alleycat
+rustfmt --edition 2024 --check <touched Rust files>
+cargo metadata --no-deps --format-version 1
+git diff --check
 ```
+
+Non-destructive runtime audit on 2026-05-23 21:45:15 -0700:
+
+- `systemctl --user is-active alleycat.service` => `active`.
+- `systemctl --user is-active codex-rc-keeper.service` => `active`.
+- `systemctl --user is-enabled codex-rc-keeper.service` => `enabled`.
+- `alleycat status --json` did not include `codexRemoteControl`, so the native
+  T2 binary has not been cut over yet.
+- `~/.cargo/bin/alleycat` timestamp was `2026-05-22 22:50:00.898343723 -0700`,
+  predating the native T2 commits.
+- Listener check still showed `127.0.0.1:8390`, `127.0.0.1:8391`, and
+  `127.0.0.1:5852` owned by the running `alleycat` process.
 
 Important live evidence:
 
@@ -103,8 +118,6 @@ scripts/codex-rc-keeper --once --dry-run-enable
 
 ## Remaining work
 
-- Run final formatting and diff checks: `cargo fmt --check` and
-  `git diff --check`.
 - After explicit approval, run cutover: `cargo install --locked --path
   crates/alleycat`, `systemctl --user restart alleycat.service`, then verify
   `systemctl --user status alleycat.service`, `systemctl --user status
