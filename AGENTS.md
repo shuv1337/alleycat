@@ -46,9 +46,9 @@ This fork **never** uses `CodexMode::UnixDaemon`, even when the local `codex` bu
 - Operational implication: there is **no codex app-server outside alleycat's cgroup** in steady state. If you see one, it is a regression — kill it, remove `~/.codex/app-server-daemon/app-server.pid` and `~/.codex/app-server-control/app-server-control.sock`, restart alleycat, and investigate the path that bypassed alleycat.
 - The codex CLI wrapper at `~/dotfiles/codex/codex` and the Codex Desktop launcher (`~/repos/codex-desktop-linux/launcher/start.sh.template`) both refuse to start without a healthy alleycat, so the only legitimate path to a codex app-server child is through alleycat.
 
-### Codex remote-control keeper
+### Codex remote-control supervision
 
-T1 remote-control supervision is installed as a standalone user service, not native Rust alleycat code yet.
+T1 remote-control supervision is installed as a standalone user service and remains the rollback path until native T2 is installed and verified. T2 native code now lives in `crates/codex-remote-control/` and is wired from `crates/alleycat/src/agents.rs`, but do not treat it as production-active until `cargo install --locked --path crates/alleycat` and the approved cutover/restart validation have happened.
 
 - Repo source: `scripts/codex-rc-keeper`; installed script: `~/.local/bin/codex-rc-keeper`.
 - Repo unit template: `scripts/codex-rc-keeper.service`; installed unit: `~/.config/systemd/user/codex-rc-keeper.service`.
@@ -57,6 +57,16 @@ T1 remote-control supervision is installed as a standalone user service, not nat
 - On each connection the keeper sends `initialize` and `initialized`, consumes `remoteControl/status/changed`, and calls `remoteControl/enable` when status is disabled, errored, missing, or stale. The default health loop is 30s; stale connected status is refreshed after 300s.
 - On socket disconnect, usually from `systemctl --user restart alleycat.service`, the keeper reconnects to the respawned codex app-server and re-enables remote control from a fresh status snapshot.
 - If app-server sends `account/chatgptAuthTokens/refresh`, the keeper answers from `~/.codex/auth.json` without logging token values. It does not opt into attestation; any unexpected `attestation/generate` request is a blocker and should be investigated from the keeper journal.
+
+Native T2 notes:
+
+- Package: `alleycat-codex-remote-control`; crate path: `crates/codex-remote-control/`.
+- `AgentManager` starts the native supervisor only for `CodexMode::UnixProxy` after a reachable Codex Unix app-server endpoint exists, and stops it with the managed Codex app-server child.
+- The native supervisor uses WebSocket-over-Unix-socket via `tokio_tungstenite`, sends `initialize` then `initialized`, handles `remoteControl/status/changed`, calls `remoteControl/enable` for disabled/errored/missing/stale state, answers `account/chatgptAuthTokens/refresh` from the current Codex auth file, and records `attestation/generate` as blocked without inventing attestation.
+- `alleycat status --json` includes `codexRemoteControl` when the running binary is in UnixProxy mode. The status object includes state, server name, environment id, last update time, last enable reason, and error/blocked summary; it must not include token material.
+- Before cutover, validate with `cargo test -p alleycat-codex-remote-control`, `cargo test -p alleycat`, `cargo fmt --check`, and `git diff --check`.
+- Cutover requires explicit approval before running `cargo install --locked --path crates/alleycat`, restarting `alleycat.service`, or stopping/disabling `codex-rc-keeper.service`.
+- Rollback for T1 keeper: `systemctl --user enable --now codex-rc-keeper.service`. If the native binary has already been installed and must be backed out, reinstall the prior known-good Alleycat binary or revert and reinstall from this checkout, then restart `alleycat.service`.
 
 Useful commands:
 

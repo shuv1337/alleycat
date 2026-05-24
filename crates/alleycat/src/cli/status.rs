@@ -56,6 +56,25 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
     if let Some(endpoint) = &info.http_endpoint {
         println!("  http endpoint:     {endpoint}");
     }
+    if let Some(remote) = &info.codex_remote_control {
+        print!("  codex remote ctl:  state={:?}", remote.state);
+        if let Some(server_name) = &remote.server_name {
+            print!(" server={server_name}");
+        }
+        if let Some(environment_id) = &remote.environment_id {
+            print!(" env={environment_id}");
+        }
+        if let Some(reason) = &remote.last_enable_reason {
+            print!(" enable_reason={reason}");
+        }
+        if let Some(error) = &remote.error {
+            print!(" error={error}");
+        }
+        if let Some(blocked) = &remote.blocked {
+            print!(" blocked={blocked}");
+        }
+        println!();
+    }
     println!("  config:            {}", info.config_path);
     if info.uptime_secs > 0 {
         println!("  uptime (s):        {}", info.uptime_secs);
@@ -120,5 +139,6 @@ async fn offline_status() -> anyhow::Result<StatusInfo> {
         agents: agent_list,
         version: Some(crate::binary_version().to_string()),
         http_endpoint: None,
+        codex_remote_control: None,
     })
 }

@@ -78,16 +78,19 @@ A small process that:
   `journalctl --user -fu codex-rc-keeper.service`.
 - Success criteria: `shuvdev` stays visible in ChatGPT app for >24h across at least 2 `systemctl --user restart alleycat.service` cycles.
 
-### Tier 2 — Native alleycat integration (after T1 proves the concept)
+### Tier 2 — Native alleycat integration
 
-- New tokio task spawned by the codex agent code in `crates/alleycat/src/agents.rs` (or a small new crate `crates/codex-remote-control/` mirroring the shape of `claude-remote-control`).
-- Lifecycle: tied to the codex app-server child. Start when the child is up; stop when it dies; restart when it respawns.
+- Implemented as a new crate: `crates/codex-remote-control/`, package `alleycat-codex-remote-control`.
+- Lifecycle is wired from `crates/alleycat/src/agents.rs`: start after a reachable UnixProxy Codex app-server endpoint exists; stop with the managed Codex app-server child; restart when the child respawns.
 - Same JSON-RPC client logic as T1 but in Rust, using a WebSocket client over
-  Unix sockets and the existing `bridge-core` JSON-RPC envelope helpers where
-  useful.
-- Status visible in `alleycat status` output (e.g., `agents.codex.remote_control = "active" | "inactive" | "error: …"`).
+  Unix sockets.
+- Status visible in `alleycat status --json` as `codexRemoteControl` with state,
+  server name, environment id, last update time, last enable reason, and
+  error/blocked summary. Token material must never appear there.
 - Logs to `~/.local/state/alleycat/logs/daemon.log.<date>`.
-- Retired the standalone T1 unit once T2 is shipping in alleycat.
+- The standalone T1 unit remains installed until native cutover is explicitly
+  approved, installed, restarted, and verified across at least one Alleycat
+  restart.
 
 ---
 
@@ -123,12 +126,17 @@ A small process that:
 - [x] Document final state in `AGENTS.md` under "Codex remote-control keeper".
 - [ ] Observe for 24h and at least two alleycat restart cycles before push or T2.
 
-## Tasks (T2 — only after T1 has run stable for ≥24h)
+## Tasks (T2)
 
-- [ ] Decide: new `crates/codex-remote-control/` crate vs. inline module in `crates/alleycat/`.
-- [ ] Port the Python supervisor to Rust (probably using the existing `bridge-core` JSON-RPC helpers).
-- [ ] Wire lifecycle to the codex app-server child's start/stop in `agents.rs`.
-- [ ] Expose status in `alleycat status` JSON.
+- [x] Decide: new `crates/codex-remote-control/` crate vs. inline module in `crates/alleycat/`.
+- [x] Port the Python supervisor to Rust.
+- [x] Wire lifecycle to the codex app-server child's start/stop in `agents.rs`.
+- [x] Expose status in `alleycat status` JSON.
+- [x] Validate locally with `cargo test -p alleycat-codex-remote-control` and `cargo test -p alleycat`.
+- [ ] Run final `cargo fmt --check` and `git diff --check`.
+- [ ] Install the new Alleycat binary after explicit approval.
+- [ ] Restart Alleycat after explicit approval and verify native status reaches `connected`.
+- [ ] Verify native restart recovery across at least one more Alleycat restart.
 - [ ] Stop + disable the T1 systemd unit.
 - [ ] Update `AGENTS.md`.
 

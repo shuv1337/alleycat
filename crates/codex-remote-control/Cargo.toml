@@ -1,0 +1,29 @@
+[package]
+name = "alleycat-codex-remote-control"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Native Codex app-server remote-control supervisor for Alleycat."
+
+[lib]
+name = "alleycat_codex_remote_control"
+path = "src/lib.rs"
+
+[dependencies]
+alleycat-codex-proto = { workspace = true }
+anyhow = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+tempfile = { workspace = true }

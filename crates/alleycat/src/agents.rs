@@ -15,6 +15,10 @@ use alleycat_bridge_core::{
     UserEnvironmentLauncher,
 };
 use alleycat_claude_bridge::ClaudeBridge;
+use alleycat_codex_remote_control::{
+    CodexRemoteControlConfig, CodexRemoteControlHandle, CodexRemoteControlSnapshot,
+    CodexRemoteControlTuning,
+};
 use alleycat_devin_bridge::DevinBridge;
 use alleycat_droid_bridge::DroidBridge;
 use alleycat_grok_bridge::GrokBridge;
@@ -129,6 +133,10 @@ pub struct AgentManager {
     /// app-server alive (`UnixProxy` or legacy `Websocket`). Not populated when
     /// Alleycat is proxying to an externally-started Codex app-server.
     codex_child: Arc<Mutex<Option<Child>>>,
+    /// Native remote-control enablement loop for the Alleycat-owned Codex
+    /// UnixProxy app-server. The crate owns protocol details; AgentManager only
+    /// starts, stops, and reports its status.
+    codex_remote_control: CodexRemoteControlHandle,
     /// Detected once at startup. Determines whether `serve_codex` runs the
     /// upstream daemon proxy, legacy Unix proxy, legacy websocket byte-pump, or
     /// per-stream stdio bridging.
@@ -302,6 +310,7 @@ impl AgentManager {
             bridges,
             opencode_bridge: Arc::new(OnceCell::new()),
             codex_child: Arc::new(Mutex::new(None)),
+            codex_remote_control: CodexRemoteControlHandle::new(),
             codex_mode: codex_detection.mode,
             codex_bin: codex_detection.bin,
             codex_available: codex_detection.available,
@@ -585,7 +594,16 @@ impl AgentManager {
         if let Some(opencode) = self.opencode_bridge.get() {
             opencode.shutdown().await;
         }
+        self.codex_remote_control.stop().await;
         self.stop_codex_child().await;
+    }
+
+    pub async fn codex_remote_control_status(&self) -> Option<CodexRemoteControlSnapshot> {
+        if self.codex_mode == CodexMode::UnixProxy {
+            Some(self.codex_remote_control.status().await)
+        } else {
+            None
+        }
     }
 
     pub async fn list_agents(&self) -> Vec<AgentInfo> {
@@ -775,6 +793,7 @@ impl AgentManager {
                     .map(|_| ())?;
             }
             CodexMode::UnixProxy => {
+                self.codex_remote_control.stop().await;
                 self.stop_codex_child().await;
                 let endpoint = self.ensure_codex_unix_running().await?;
                 info!(
@@ -798,6 +817,7 @@ impl AgentManager {
     }
 
     async fn stop_codex_child(&self) -> bool {
+        self.codex_remote_control.stop().await;
         let mut guard = self.codex_child.lock().await;
         if let Some(mut child) = guard.take() {
             terminate_codex_child(&mut child, "app-server").await;
@@ -949,7 +969,12 @@ impl AgentManager {
         let endpoint = if let Some(default_endpoint) = default_endpoint {
             if let Some(child) = guard.as_mut() {
                 match child.try_wait() {
-                    Ok(None) => return Ok(default_endpoint),
+                    Ok(None) => {
+                        let endpoint = default_endpoint;
+                        drop(guard);
+                        self.start_codex_remote_control(&endpoint, &env).await;
+                        return Ok(endpoint);
+                    }
                     Ok(Some(status)) => {
                         info!("discarding exited codex app-server child status={status}");
                         *guard = None;
@@ -988,7 +1013,11 @@ impl AgentManager {
         match probe_codex_app_server_proxy(&endpoint.bin, endpoint.socket_path.as_deref(), &env)
             .await
         {
-            Ok(()) => return Ok(endpoint),
+            Ok(()) => {
+                drop(guard);
+                self.start_codex_remote_control(&endpoint, &env).await;
+                return Ok(endpoint);
+            }
             Err(error) => {
                 if endpoint.socket_path.is_none()
                     && let Some(socket_path) =
@@ -1012,8 +1041,12 @@ impl AgentManager {
             }
         }
 
-        self.ensure_codex_unix_running_locked(endpoint, &env, &mut *guard)
-            .await
+        let endpoint = self
+            .ensure_codex_unix_running_locked(endpoint, &env, &mut *guard)
+            .await?;
+        drop(guard);
+        self.start_codex_remote_control(&endpoint, &env).await;
+        Ok(endpoint)
     }
 
     async fn ensure_codex_unix_running_with_endpoint(
@@ -1025,11 +1058,16 @@ impl AgentManager {
             .await
             .is_ok()
         {
+            self.start_codex_remote_control(&endpoint, env).await;
             return Ok(endpoint);
         }
         let mut guard = self.codex_child.lock().await;
-        self.ensure_codex_unix_running_locked(endpoint, env, &mut *guard)
-            .await
+        let endpoint = self
+            .ensure_codex_unix_running_locked(endpoint, env, &mut *guard)
+            .await?;
+        drop(guard);
+        self.start_codex_remote_control(&endpoint, env).await;
+        Ok(endpoint)
     }
 
     async fn ensure_codex_unix_running_locked(
@@ -1112,6 +1150,31 @@ impl AgentManager {
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+    }
+
+    async fn start_codex_remote_control(
+        &self,
+        endpoint: &CodexUnixEndpoint,
+        env: &LaunchEnvironment,
+    ) {
+        if self.codex_mode != CodexMode::UnixProxy {
+            return;
+        }
+        let Some(socket_path) = codex_remote_control_socket_path(endpoint, env) else {
+            warn!("codex remote control cannot resolve control socket path");
+            return;
+        };
+        let Some(auth_path) = codex_auth_path(env) else {
+            warn!("codex remote control cannot resolve auth path");
+            return;
+        };
+        self.codex_remote_control
+            .start_or_update(CodexRemoteControlConfig {
+                socket_path,
+                auth_path,
+                tuning: CodexRemoteControlTuning::default(),
+            })
+            .await;
     }
 
     /// Per-stream stdio bridge for codex versions that don't support
@@ -1738,22 +1801,40 @@ fn alleycat_codex_control_socket_path(default_socket_path: &Path) -> PathBuf {
         .unwrap_or_else(|| default_socket_path.with_file_name("alleycat-app-server-control.sock"))
 }
 
+fn codex_remote_control_socket_path(
+    endpoint: &CodexUnixEndpoint,
+    env: &LaunchEnvironment,
+) -> Option<PathBuf> {
+    endpoint
+        .socket_path
+        .clone()
+        .or_else(|| default_codex_control_socket_path(env))
+}
+
+fn codex_auth_path(env: &LaunchEnvironment) -> Option<PathBuf> {
+    Some(codex_home_path(env)?.join("auth.json"))
+}
+
 #[cfg(unix)]
 fn default_codex_control_socket_path(env: &LaunchEnvironment) -> Option<PathBuf> {
-    let codex_home = match env_path(env, "CODEX_HOME") {
-        Some(path) => {
-            if !path.is_dir() {
-                return None;
-            }
-            path.canonicalize().ok()?
-        }
-        None => directories::BaseDirs::new()?.home_dir().join(".codex"),
-    };
+    let codex_home = codex_home_path(env)?;
     Some(
         codex_home
             .join("app-server-control")
             .join("app-server-control.sock"),
     )
+}
+
+fn codex_home_path(env: &LaunchEnvironment) -> Option<PathBuf> {
+    match env_path(env, "CODEX_HOME") {
+        Some(path) => {
+            if !path.is_dir() {
+                return None;
+            }
+            path.canonicalize().ok()
+        }
+        None => Some(directories::BaseDirs::new()?.home_dir().join(".codex")),
+    }
 }
 
 fn env_path(env: &LaunchEnvironment, key: &str) -> Option<PathBuf> {

@@ -74,6 +74,7 @@ dependencies = [
  "alleycat-amp-bridge",
  "alleycat-bridge-core",
  "alleycat-claude-bridge",
+ "alleycat-codex-remote-control",
  "alleycat-devin-bridge",
  "alleycat-droid-bridge",
  "alleycat-grok-bridge",
@@ -247,6 +248,23 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "alleycat-codex-remote-control"
+version = "0.1.0"
+dependencies = [
+ "alleycat-codex-proto",
+ "anyhow",
+ "futures",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
 ]
 
 [[package]]

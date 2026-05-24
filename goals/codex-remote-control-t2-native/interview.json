@@ -1,0 +1,153 @@
+{
+  "stage": "interview",
+  "title": "Codex Remote-Control T2 Native Integration",
+  "goalSlug": "codex-remote-control-t2-native",
+  "questions": [
+    {
+      "id": "entry_gate",
+      "prompt": "What should gate the start of T2 implementation?",
+      "description": "The current T1 keeper is stable in your testing. This determines whether the goal may proceed directly or must preserve an observation gate.",
+      "answerMode": "single-custom",
+      "recommendedAnswer": "Proceed with T2 planning and implementation now, but require the goal to preserve T1 as rollback and validate native recovery before disabling the service.",
+      "recommendedOptionIds": ["proceed_keep_rollback"],
+      "options": [
+        {
+          "id": "proceed_keep_rollback",
+          "label": "Proceed, keep rollback"
+        },
+        {
+          "id": "wait_24h",
+          "label": "Wait for 24h gate"
+        },
+        {
+          "id": "plan_only",
+          "label": "Plan only"
+        }
+      ],
+      "required": true
+    },
+    {
+      "id": "implementation_shape",
+      "prompt": "Where should the native T2 code live initially?",
+      "description": "The repo already has the needed dependencies in the alleycat crate, and the lifecycle hooks are inside the Codex agent manager.",
+      "answerMode": "single-custom",
+      "recommendedAnswer": "Start as an inline `crates/alleycat/src/codex_remote_control.rs` module wired from `agents.rs`; split to a crate only if the module becomes reusable or too large.",
+      "recommendedOptionIds": ["inline_module"],
+      "options": [
+        {
+          "id": "inline_module",
+          "label": "Inline module"
+        },
+        {
+          "id": "new_crate",
+          "label": "New crate"
+        },
+        {
+          "id": "minimal_agents_rs",
+          "label": "Only agents.rs"
+        }
+      ],
+      "required": true
+    },
+    {
+      "id": "status_surface",
+      "prompt": "How much remote-control state should T2 expose through Alleycat?",
+      "description": "This affects `alleycat status --json` and operator debugging, but should avoid leaking auth tokens or unnecessary internal details.",
+      "answerMode": "multi-custom",
+      "recommendedAnswer": "Expose a concise Codex remote-control status object in `alleycat status --json`: state, server name, environment id, last update, last enable reason, and blocked/error summary with no token material.",
+      "recommendedOptionIds": ["state", "server_environment", "timestamps_reason", "errors_blocked"],
+      "options": [
+        {
+          "id": "state",
+          "label": "State"
+        },
+        {
+          "id": "server_environment",
+          "label": "Server/env"
+        },
+        {
+          "id": "timestamps_reason",
+          "label": "Times/reason"
+        },
+        {
+          "id": "errors_blocked",
+          "label": "Errors/blocked"
+        },
+        {
+          "id": "no_status",
+          "label": "No status surface"
+        }
+      ],
+      "required": true
+    },
+    {
+      "id": "cutover_policy",
+      "prompt": "What should the goal do with the existing `codex-rc-keeper.service` during T2 cutover?",
+      "description": "Running both native T2 and T1 long term could create redundant `remoteControl/enable` calls, but T1 is useful rollback.",
+      "answerMode": "single-custom",
+      "recommendedAnswer": "Keep T1 installed, stop and disable it only after the native task is installed and verified, and document the exact rollback command.",
+      "recommendedOptionIds": ["stop_after_verify"],
+      "options": [
+        {
+          "id": "stop_after_verify",
+          "label": "Stop after verify"
+        },
+        {
+          "id": "leave_running",
+          "label": "Leave running"
+        },
+        {
+          "id": "remove_t1",
+          "label": "Remove T1"
+        }
+      ],
+      "required": true
+    },
+    {
+      "id": "deployment_scope",
+      "prompt": "Should this goal include installing/restarting the production Alleycat service and live validation?",
+      "description": "T2 cannot be fully proven without the installed binary and `alleycat.service`, but that is an operational step.",
+      "answerMode": "single-custom",
+      "recommendedAnswer": "Yes. Include `cargo install --locked --path crates/alleycat`, `systemctl --user restart alleycat.service`, live status/log validation, and at least one remote-control recovery cycle.",
+      "recommendedOptionIds": ["install_restart_validate"],
+      "options": [
+        {
+          "id": "install_restart_validate",
+          "label": "Install/restart/validate"
+        },
+        {
+          "id": "code_only",
+          "label": "Code only"
+        },
+        {
+          "id": "ask_before_restart",
+          "label": "Ask before restart"
+        }
+      ],
+      "required": true
+    },
+    {
+      "id": "push_policy",
+      "prompt": "What should the goal do about git push once T2 is implemented?",
+      "description": "The current branch is local-only and ahead of origin; previous work intentionally avoided pushing before soak.",
+      "answerMode": "single-custom",
+      "recommendedAnswer": "Do not push. Commit locally and leave push as a separate explicit decision after native soak.",
+      "recommendedOptionIds": ["no_push"],
+      "options": [
+        {
+          "id": "no_push",
+          "label": "No push"
+        },
+        {
+          "id": "push_after_validation",
+          "label": "Push after validation"
+        },
+        {
+          "id": "ask_before_push",
+          "label": "Ask before push"
+        }
+      ],
+      "required": true
+    }
+  ]
+}

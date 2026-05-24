@@ -8,7 +8,10 @@ Keep the local codex app-server's ChatGPT remote-control connection alive so
 
 ## Current status
 
-T1 is implemented, installed, enabled, and active locally.
+T1 is implemented, installed, enabled, and active locally. T2 native code has
+now been implemented in the checkout, but it has not been installed into the
+production `~/.cargo/bin/alleycat` binary and `alleycat.service` has not been
+restarted for cutover validation.
 
 - Documentation handoff state was committed first in
   `f32c0c4 docs: record post-merge alleycat state and rc plan`.
@@ -22,10 +25,19 @@ T1 is implemented, installed, enabled, and active locally.
 - Alleycat state: `alleycat.service` is active with listeners on
   `127.0.0.1:8390`, `127.0.0.1:8391`, and `127.0.0.1:5852`.
 - `~/.codex/log/codex-tui.log` was truncated before restart-heavy validation.
+- T2 crate: `crates/codex-remote-control/`, package
+  `alleycat-codex-remote-control`.
+- T2 Alleycat wiring: `crates/alleycat/src/agents.rs` starts the native
+  supervisor for `CodexMode::UnixProxy` after a reachable Unix app-server
+  endpoint exists, stops it with the Codex app-server child, and exposes status
+  through daemon status.
+- Status surface: `alleycat status --json` includes `codexRemoteControl` in
+  UnixProxy mode with state, server name, environment id, last update time,
+  last enable reason, and redacted error/blocked summary.
 
-Do not push `origin/main` and do not start T2/native Rust integration until the
-T1 service has stayed green for 24 hours and survived at least two alleycat
-restart cycles.
+Do not push `origin/main`. Do not install the new Alleycat binary, restart
+`alleycat.service`, or stop/disable `codex-rc-keeper.service` without explicit
+cutover approval.
 
 ## Implementation notes
 
@@ -59,6 +71,13 @@ systemctl --user is-active codex-rc-keeper.service
 systemctl --user is-active alleycat.service
 ```
 
+T2 local validation already run successfully:
+
+```bash
+cargo test -p alleycat-codex-remote-control
+cargo test -p alleycat
+```
+
 Important live evidence:
 
 - One-shot probe reached `connected` over
@@ -82,8 +101,16 @@ scripts/codex-rc-keeper --once --dry-run-enable
 
 ## Remaining work
 
-- Observe the T1 service for 24 hours.
-- Confirm it survives at least two alleycat restart cycles during that
-  observation window.
-- Only after that, decide whether to push `main` and begin T2/native alleycat
-  integration.
+- Run final formatting and diff checks: `cargo fmt --check` and
+  `git diff --check`.
+- After explicit approval, run cutover: `cargo install --locked --path
+  crates/alleycat`, `systemctl --user restart alleycat.service`, then verify
+  `systemctl --user status alleycat.service`, `systemctl --user status
+  codex-rc-keeper.service`, `alleycat status --json`, listener/socket state,
+  and journal evidence that native remote control reaches `connected`.
+- Restart Alleycat at least once more and verify native remote control returns
+  to `connected`.
+- Stop and disable `codex-rc-keeper.service` only after native restart recovery
+  is proven.
+- Commit locally after validation; do not push `origin/main` without a separate
+  explicit decision.

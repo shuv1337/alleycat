@@ -157,6 +157,8 @@ pub enum RemoteControlConnectionStatus {
 pub struct RemoteControlStatusChangedNotification {
     pub status: RemoteControlConnectionStatus,
     #[serde(default)]
+    pub server_name: Option<String>,
+    #[serde(default)]
     pub environment_id: Option<String>,
 }
 

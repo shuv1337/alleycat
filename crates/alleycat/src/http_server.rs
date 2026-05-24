@@ -511,6 +511,7 @@ async fn status_info(
         agents: state.agents.list_agents().await,
         version: Some(state.binary_version.clone()),
         http_endpoint: http_endpoint.map(|addr| format!("http://{addr}")),
+        codex_remote_control: state.agents.codex_remote_control_status().await,
     })
 }
 

@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use alleycat_codex_remote_control::CodexRemoteControlSnapshot;
+
 use crate::protocol::{AgentInfo, PairPayload};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,6 +79,9 @@ pub struct StatusInfo {
     /// Local HTTP/WebSocket endpoint, when `serve --serve-pwa` is active.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_endpoint: Option<String>,
+    /// Native Codex remote-control supervisor status, present for UnixProxy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_remote_control: Option<CodexRemoteControlSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,5 +133,23 @@ mod tests {
         let f = token_fingerprint("deadbeef");
         assert_eq!(f.len(), 16);
         assert!(f.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn status_info_omits_absent_codex_remote_control() {
+        let info = StatusInfo {
+            pid: 0,
+            node_id: "node".to_string(),
+            token_short: "token".to_string(),
+            relay: None,
+            config_path: "/tmp/host.toml".to_string(),
+            uptime_secs: 0,
+            agents: Vec::new(),
+            version: None,
+            http_endpoint: None,
+            codex_remote_control: None,
+        };
+        let rendered = serde_json::to_string(&info).unwrap();
+        assert!(!rendered.contains("codexRemoteControl"));
     }
 }

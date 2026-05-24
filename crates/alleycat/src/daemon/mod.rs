@@ -307,6 +307,7 @@ async fn handle_status(daemon: &DaemonState) -> Response {
         agents: daemon.agents.list_agents().await,
         version: Some(crate::binary_version().to_string()),
         http_endpoint: daemon.http_endpoint.map(|addr| format!("http://{addr}")),
+        codex_remote_control: daemon.agents.codex_remote_control_status().await,
     };
     Response::ok_with(&info).unwrap_or_else(|e| Response::err(e.to_string()))
 }
