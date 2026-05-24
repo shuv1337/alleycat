@@ -60,9 +60,9 @@ Expected:
 
 - `alleycat.service` is active.
 - `codex-rc-keeper.service` is still active at this point.
-- `alleycat status --json` includes `codexRemoteControl`.
-- `codexRemoteControl.state` reaches `connected`.
-- `codexRemoteControl` does not contain token material.
+- `alleycat status --json` includes `codex_remote_control` (snake_case in the JSON payload).
+- `codex_remote_control.state` reaches `connected`.
+- `codex_remote_control` does not contain token material.
 
 Check listeners:
 
@@ -90,7 +90,7 @@ journalctl --user -u alleycat.service --since "10 minutes ago" --no-pager
 Expected:
 
 - `alleycat.service` is active after restart.
-- `codexRemoteControl.state` returns to `connected`.
+- `codex_remote_control.state` returns to `connected`.
 - Journal evidence shows the native supervisor initialized Codex app-server and called or maintained `remoteControl/enable`.
 - No `attestation/generate` blocker appears.
 - No token values appear in logs or status.
@@ -108,7 +108,7 @@ alleycat status --json
 Expected:
 
 - `codex-rc-keeper.service` is disabled/inactive.
-- Native `codexRemoteControl.state` remains `connected`.
+- Native `codex_remote_control.state` remains `connected`.
 
 ## Rollback
 
@@ -137,7 +137,7 @@ Record these in `HANDOFF.md` or a follow-up commit:
 - Exact `cargo install` time.
 - `systemctl --user status alleycat.service` result.
 - `systemctl --user status codex-rc-keeper.service` result before and after T1 disable.
-- `alleycat status --json` excerpt showing `codexRemoteControl.state == "connected"`.
+- `alleycat status --json` excerpt showing `codex_remote_control.state == "connected"`.
 - Listener check output for `8390`, `8391`, and `5852`.
 - Journal excerpt showing native reconnect after the second Alleycat restart.
 - Whether rollback was needed.

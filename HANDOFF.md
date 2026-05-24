@@ -136,3 +136,38 @@ scripts/codex-rc-keeper --once --dry-run-enable
   is proven.
 - Commit locally after validation; do not push `origin/main` without a separate
   explicit decision.
+
+## Cutover completion 2026-05-24
+
+Executed from a shuvcode (pi) session (not routed through Alleycat). All steps
+from `goals/codex-remote-control-t2-native/external-cutover.md` succeeded.
+
+- `cargo install --locked --path crates/alleycat` started at
+  `2026-05-24T00:27:23-07:00` (PDT). Replaced `~/.cargo/bin/alleycat` and
+  `~/.cargo/bin/alleycat-startup`.
+- First `systemctl --user restart alleycat.service` at 2026-05-24 00:27:49 PDT.
+  `alleycat.service` came up active; native supervisor initialized at
+  2026-05-24T07:28:04.886537Z (UTC) with
+  `user_agent=alleycat-codex-remote-control/0.133.0 ... (alleycat-codex-remote-control; 0.1.0)`.
+  `remoteControl/enable` called with `source="initial" reason=status:errored`
+  and again with `source="interval"`; status then reached `connected`.
+- Second `systemctl --user restart alleycat.service` at 2026-05-24 00:28:56 PDT
+  (restart recovery). Native supervisor re-initialized at
+  2026-05-24T07:29:11.116017Z and re-reached `connected` for
+  `serverName=shuvdev`,
+  `environmentId=env_e_6a0c127bd3a88333a18a070c79e945b3`. No
+  `attestation/generate` request appeared; no token values logged.
+- `systemctl --user disable --now codex-rc-keeper.service` at 2026-05-24
+  00:29:11 PDT. Keeper transitioned to `inactive (dead)` / `disabled`. Native
+  `codex_remote_control.state` remained `connected` afterward.
+- Listener check (post-restart) showed `127.0.0.1:8390`, `127.0.0.1:8391`,
+  and `127.0.0.1:5852` owned by the new `alleycat` PID 56267.
+- Status surface naming: `alleycat status --json` actually serializes the
+  native field as `codex_remote_control` (snake_case), not `codexRemoteControl`
+  as written in the external-cutover runbook. Update the runbook before reuse.
+- Rollback was not needed. T1 keeper remains installed but disabled and is the
+  documented rollback path.
+
+Production owner of codex remote-control is now the native T2 supervisor inside
+`alleycat.service`. Do not push `origin/main` without explicit approval; soak
+the native path for the agreed window first.

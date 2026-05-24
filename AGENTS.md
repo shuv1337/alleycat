@@ -48,7 +48,7 @@ This fork **never** uses `CodexMode::UnixDaemon`, even when the local `codex` bu
 
 ### Codex remote-control supervision
 
-T1 remote-control supervision is installed as a standalone user service and remains the rollback path until native T2 is installed and verified. T2 native code now lives in `crates/codex-remote-control/` and is wired from `crates/alleycat/src/agents.rs`, but do not treat it as production-active until `cargo install --locked --path crates/alleycat` and the approved cutover/restart validation have happened.
+Native T2 supervision inside `alleycat.service` is the production path as of 2026-05-24. The T1 standalone keeper service is installed but `disabled`/`inactive` and is retained as the documented rollback path. Do not re-enable T1 unless native T2 misbehaves.
 
 - Repo source: `scripts/codex-rc-keeper`; installed script: `~/.local/bin/codex-rc-keeper`.
 - Repo unit template: `scripts/codex-rc-keeper.service`; installed unit: `~/.config/systemd/user/codex-rc-keeper.service`.
@@ -63,10 +63,10 @@ Native T2 notes:
 - Package: `alleycat-codex-remote-control`; crate path: `crates/codex-remote-control/`.
 - `AgentManager` starts the native supervisor only for `CodexMode::UnixProxy` after a reachable Codex Unix app-server endpoint exists, and stops it with the managed Codex app-server child.
 - The native supervisor uses WebSocket-over-Unix-socket via `tokio_tungstenite`, sends `initialize` then `initialized`, handles `remoteControl/status/changed`, calls `remoteControl/enable` for disabled/errored/missing/stale state, answers `account/chatgptAuthTokens/refresh` from the current Codex auth file, and records `attestation/generate` as blocked without inventing attestation.
-- `alleycat status --json` includes `codexRemoteControl` when the running binary is in UnixProxy mode. The status object includes state, server name, environment id, last update time, last enable reason, and error/blocked summary; it must not include token material.
+- `alleycat status --json` includes `codex_remote_control` (snake_case in the JSON payload, despite earlier docs saying `codexRemoteControl`) when the running binary is in UnixProxy mode. The status object includes state, server name, environment id, last update time, last enable reason, and error/blocked summary; it must not include token material.
 - Before cutover, validate with `cargo test -p alleycat-codex-remote-control`, `cargo test -p alleycat`, `cargo fmt --check`, and `git diff --check`.
-- Cutover requires explicit approval before running `cargo install --locked --path crates/alleycat`, restarting `alleycat.service`, or stopping/disabling `codex-rc-keeper.service`.
-- Rollback for T1 keeper: `systemctl --user enable --now codex-rc-keeper.service`. If the native binary has already been installed and must be backed out, reinstall the prior known-good Alleycat binary or revert and reinstall from this checkout, then restart `alleycat.service`.
+- Cutover completed 2026-05-24: `cargo install --locked --path crates/alleycat` ran at `2026-05-24T00:27:23-07:00`, two consecutive `systemctl --user restart alleycat.service` cycles both reached `codex_remote_control.state == "connected"` for `serverName=shuvdev`, and `codex-rc-keeper.service` was disabled with `--now` afterward. See HANDOFF.md "Cutover completion 2026-05-24" for the full evidence trail.
+- Rollback to T1 keeper: `systemctl --user enable --now codex-rc-keeper.service`. If the native binary has already been installed and must be backed out, reinstall the prior known-good Alleycat binary or revert and reinstall from this checkout, then restart `alleycat.service`.
 
 Useful commands:
 
@@ -77,7 +77,9 @@ systemctl --user restart codex-rc-keeper.service
 scripts/codex-rc-keeper --once --dry-run-enable
 ```
 
-Validation on 2026-05-23: the keeper was installed, enabled, and started; `~/.codex/log/codex-tui.log` was truncated before restart-heavy testing; an alleycat restart at 2026-05-23 09:39:13 was followed by keeper reconnect and `remoteControl/enable`, reaching `connected` at 2026-05-23 09:39:29.988. Do not push this branch or start T2/native Rust integration until the T1 service has stayed green for 24 hours and survived at least two alleycat restart cycles.
+Validation on 2026-05-23: the keeper was installed, enabled, and started; `~/.codex/log/codex-tui.log` was truncated before restart-heavy testing; an alleycat restart at 2026-05-23 09:39:13 was followed by keeper reconnect and `remoteControl/enable`, reaching `connected` at 2026-05-23 09:39:29.988.
+
+Native T2 cutover on 2026-05-24: native supervisor initialized at 2026-05-24T07:28:04.886537Z (UTC), reached `connected`, survived a second `alleycat.service` restart (re-initialized at 2026-05-24T07:29:11.116017Z, returned to `connected`), no `attestation/generate` request appeared, and no token material was logged. T1 keeper disabled with `--now` at 2026-05-24 00:29:11 PDT. Do not push `origin/main` without explicit approval; let native T2 soak first.
 
 ## Single-instance topology
 

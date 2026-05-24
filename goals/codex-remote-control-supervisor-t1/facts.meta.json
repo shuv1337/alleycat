@@ -1,0 +1,95 @@
+{
+  "facts": [
+    {
+      "id": "fact-1",
+      "text": "The current documentation handoff state is committed locally, including AGENTS.md and PLAN-codex-remote-control-supervisor.md, before or alongside the T1 implementation work.",
+      "comment": "",
+      "recommendedAutomatedVerification": true,
+      "automatedVerification": true
+    },
+    {
+      "id": "fact-2",
+      "text": "The T1 keeper is a standalone Python script installed at ~/.local/bin/codex-rc-keeper and uses only Python standard-library modules.",
+      "comment": "",
+      "recommendedAutomatedVerification": true,
+      "automatedVerification": true
+    },
+    {
+      "id": "fact-3",
+      "text": "The keeper connects to ~/.codex/app-server-control/app-server-control.sock as a WebSocket over the Unix socket, using standard-library HTTP Upgrade and WebSocket framing, and performs initialize followed by an initialized notification.",
+      "comment": "",
+      "recommendedAutomatedVerification": true,
+      "automatedVerification": true
+    },
+    {
+      "id": "fact-4",
+      "text": "The keeper tracks remote-control state from the initialized connection's remoteControl/status/changed notifications and from remoteControl/enable responses, and calls remoteControl/enable when the state is disabled, errored, missing, or stale.",
+      "comment": "",
+      "recommendedAutomatedVerification": true,
+      "automatedVerification": true
+    },
+    {
+      "id": "fact-5",
+      "text": "When app-server sends account/chatgptAuthTokens/refresh as a server-initiated request, the keeper answers with exact blocker evidence unless a safe token-refresh response shape is discovered from Codex Desktop or upstream tests during implementation.",
+      "comment": "",
+      "recommendedAutomatedVerification": true,
+      "automatedVerification": true
+    },
+    {
+      "id": "fact-6",
+      "text": "If remoteControl/enable requires an attestation handshake that is not already understood, the implementation stops and documents the blocker instead of inventing an unverified handshake.",
+      "comment": "",
+      "recommendedAutomatedVerification": false,
+      "automatedVerification": false
+    },
+    {
+      "id": "fact-7",
+      "text": "The keeper waits for the app-server socket on startup, reconnects after socket disconnects, logs to stdout or stderr for journald, and repeats status checks on a roughly 30-second loop.",
+      "comment": "",
+      "recommendedAutomatedVerification": true,
+      "automatedVerification": true
+    },
+    {
+      "id": "fact-8",
+      "text": "A user systemd unit exists at ~/.config/systemd/user/codex-rc-keeper.service, wants and starts after alleycat.service, restarts on failure, and runs ~/.local/bin/codex-rc-keeper.",
+      "comment": "",
+      "recommendedAutomatedVerification": true,
+      "automatedVerification": true
+    },
+    {
+      "id": "fact-9",
+      "text": "The codex-rc-keeper user service is daemon-reloaded, enabled, started, and observed as active or otherwise reported with exact blocker evidence.",
+      "comment": "",
+      "recommendedAutomatedVerification": true,
+      "automatedVerification": true
+    },
+    {
+      "id": "fact-10",
+      "text": "The huge ~/.codex/log/codex-tui.log is rotated or truncated before restart-heavy validation.",
+      "comment": "",
+      "recommendedAutomatedVerification": true,
+      "automatedVerification": true
+    },
+    {
+      "id": "fact-11",
+      "text": "Validation includes a live socket probe, keeper journal evidence, service status evidence, and at least one alleycat.service restart recovery check when safe.",
+      "comment": "",
+      "recommendedAutomatedVerification": true,
+      "automatedVerification": true
+    },
+    {
+      "id": "fact-12",
+      "text": "AGENTS.md documents the final T1 remote-control supervisor state and includes the 24-hour observation criterion for deciding whether to push main and begin T2.",
+      "comment": "",
+      "recommendedAutomatedVerification": true,
+      "automatedVerification": true
+    },
+    {
+      "id": "fact-13",
+      "text": "The implementation does not push origin/main and does not begin the native Alleycat T2 work in this goal.",
+      "comment": "",
+      "recommendedAutomatedVerification": true,
+      "automatedVerification": true
+    }
+  ]
+}

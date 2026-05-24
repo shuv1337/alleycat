@@ -1,0 +1,168 @@
+{
+  "stage": "interview",
+  "title": "Codex Remote-Control Supervisor T1",
+  "goalSlug": "codex-remote-control-supervisor-t1",
+  "questions": [
+    {
+      "id": "execution_scope",
+      "prompt": "What should this goal execute now?",
+      "description": "The handoff includes both documentation cleanup and the T1 supervisor. T2/native Rust remains deferred until after T1 stability.",
+      "answerMode": "multi-custom",
+      "recommendedAnswer": "Commit the current AGENTS.md and PLAN file, implement the standalone Python T1 keeper, install and enable its systemd user unit, validate against the live Codex app-server socket, document the final T1 state, and do not push main or start T2.",
+      "recommendedOptionIds": [
+        "commit_docs_plan",
+        "implement_t1",
+        "install_enable_unit",
+        "document_t1",
+        "defer_push_t2"
+      ],
+      "options": [
+        {
+          "id": "commit_docs_plan",
+          "label": "Commit docs and plan"
+        },
+        {
+          "id": "implement_t1",
+          "label": "Implement T1 keeper"
+        },
+        {
+          "id": "install_enable_unit",
+          "label": "Install and enable unit"
+        },
+        {
+          "id": "document_t1",
+          "label": "Document final T1 state"
+        },
+        {
+          "id": "defer_push_t2",
+          "label": "Defer push and T2"
+        }
+      ],
+      "required": true
+    },
+    {
+      "id": "operational_changes",
+      "prompt": "Which live-machine operational changes are allowed during execution?",
+      "description": "The T1 plan touches files under ~/.local/bin and ~/.config/systemd/user, and may restart alleycat for validation.",
+      "answerMode": "multi-custom",
+      "recommendedAnswer": "Allow truncating or rotating the huge codex-tui log, installing ~/.local/bin/codex-rc-keeper, writing ~/.config/systemd/user/codex-rc-keeper.service, daemon-reloading and enabling the keeper, and restarting alleycat.service only when needed for validation.",
+      "recommendedOptionIds": [
+        "rotate_log",
+        "write_user_bin",
+        "write_systemd_unit",
+        "enable_keeper",
+        "restart_alleycat_if_needed"
+      ],
+      "options": [
+        {
+          "id": "rotate_log",
+          "label": "Rotate codex log"
+        },
+        {
+          "id": "write_user_bin",
+          "label": "Write user bin"
+        },
+        {
+          "id": "write_systemd_unit",
+          "label": "Write systemd unit"
+        },
+        {
+          "id": "enable_keeper",
+          "label": "Enable keeper service"
+        },
+        {
+          "id": "restart_alleycat_if_needed",
+          "label": "Restart alleycat if needed"
+        }
+      ],
+      "required": true
+    },
+    {
+      "id": "runtime_behavior",
+      "prompt": "How should the keeper behave when remote-control status is unhealthy?",
+      "description": "This determines the first-pass recovery behavior and how far to go if the Codex JSON-RPC surface requires extra work.",
+      "answerMode": "single-custom",
+      "recommendedAnswer": "Implement initialize/initialized, status/read, enable on inactive, reconnect on socket disconnect, and token refresh on explicit auth failure; if enable requires a new attestation handshake, stop and document the blocker instead of guessing.",
+      "recommendedOptionIds": [
+        "status_enable_refresh_block_attestation"
+      ],
+      "options": [
+        {
+          "id": "status_enable_refresh_block_attestation",
+          "label": "Enable plus auth refresh"
+        },
+        {
+          "id": "status_enable_only",
+          "label": "Enable only"
+        },
+        {
+          "id": "include_attestation_research",
+          "label": "Research attestation too"
+        }
+      ],
+      "required": true
+    },
+    {
+      "id": "validation_standard",
+      "prompt": "What validation should count as done for this goal?",
+      "description": "The 24-hour stability target cannot be completed inside a normal implementation turn, so this goal needs a concrete immediate done condition plus a follow-up observation criterion.",
+      "answerMode": "multi-custom",
+      "recommendedAnswer": "Require a live socket probe, keeper service active in systemd, journal output showing status polling or enable attempts, at least one alleycat restart recovery check if safe, and written instructions for the 24-hour observation window. Manual ChatGPT app visibility can be noted as user-verified if you check it outside the terminal.",
+      "recommendedOptionIds": [
+        "live_socket_probe",
+        "service_active",
+        "journal_evidence",
+        "restart_recovery",
+        "observation_notes"
+      ],
+      "options": [
+        {
+          "id": "live_socket_probe",
+          "label": "Live socket probe"
+        },
+        {
+          "id": "service_active",
+          "label": "Service active"
+        },
+        {
+          "id": "journal_evidence",
+          "label": "Journal evidence"
+        },
+        {
+          "id": "restart_recovery",
+          "label": "Restart recovery"
+        },
+        {
+          "id": "observation_notes",
+          "label": "24h follow-up notes"
+        }
+      ],
+      "required": true
+    },
+    {
+      "id": "source_control_boundary",
+      "prompt": "What should happen with git after implementation?",
+      "description": "The handoff says local main is ahead and origin push is deliberately deferred until battle-tested.",
+      "answerMode": "single-custom",
+      "recommendedAnswer": "Create one or more local commits for the docs/plan and T1 implementation, but do not push origin/main until the keeper has been battle-tested.",
+      "recommendedOptionIds": [
+        "commit_no_push"
+      ],
+      "options": [
+        {
+          "id": "commit_no_push",
+          "label": "Commit, no push"
+        },
+        {
+          "id": "leave_uncommitted",
+          "label": "Leave uncommitted"
+        },
+        {
+          "id": "push_after_checks",
+          "label": "Push after checks"
+        }
+      ],
+      "required": true
+    }
+  ]
+}
