@@ -29,6 +29,8 @@ restarted for cutover validation.
   `alleycat-codex-remote-control`.
 - External cutover runbook:
   `goals/codex-remote-control-t2-native/external-cutover.md`.
+- Copy-pasteable external-agent goal:
+  `goals/codex-remote-control-t2-native/external-agent-goal.md`.
 - T2 Alleycat wiring: `crates/alleycat/src/agents.rs` starts the native
   supervisor for `CodexMode::UnixProxy` after a reachable Unix app-server
   endpoint exists, stops it with the Codex app-server child, and exposes status
@@ -125,8 +127,9 @@ scripts/codex-rc-keeper --once --dry-run-enable
   and journal evidence that native remote control reaches `connected`.
 - Because this Codex session is itself running behind Alleycat, do not perform
   the cutover from this session. Use
-  `goals/codex-remote-control-t2-native/external-cutover.md` from an external
-  terminal/agent.
+  `goals/codex-remote-control-t2-native/external-cutover.md` or
+  `goals/codex-remote-control-t2-native/external-agent-goal.md` from an
+  external terminal/agent.
 - Restart Alleycat at least once more and verify native remote control returns
   to `connected`.
 - Stop and disable `codex-rc-keeper.service` only after native restart recovery
