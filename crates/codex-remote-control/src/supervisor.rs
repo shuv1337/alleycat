@@ -229,9 +229,16 @@ async fn initialize(
     let request_id = take_id(next_id);
     let params = serde_json::to_value(InitializeParams {
         client_info: ClientInfo {
-            name: "alleycat-codex-remote-control".to_string(),
-            title: Some("Alleycat Codex Remote Control".to_string()),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            // ChatGPT's remote-control environment registry classifies
+            // environments by the app-server client identity that calls
+            // `remoteControl/enable`. Unknown client names can connect
+            // successfully but are omitted from the environments list shown
+            // by ChatGPT/Codex Desktop. Match the official desktop backend
+            // identity so the Alleycat-supervised Linux app-server remains
+            // visible as a Codex Desktop remote target.
+            name: "codex-backend".to_string(),
+            title: Some("Codex Desktop".to_string()),
+            version: "unknown".to_string(),
         },
         capabilities: Some(InitializeCapabilities {
             experimental_api: true,
@@ -635,6 +642,8 @@ mod tests {
                 .lock()
                 .await
                 .push(init["method"].as_str().unwrap().to_string());
+            assert_eq!(init["params"]["clientInfo"]["name"], "codex-backend");
+            assert_eq!(init["params"]["clientInfo"]["title"], "Codex Desktop");
             ws.send(Message::Text(
                 json!({
                     "jsonrpc": "2.0",
