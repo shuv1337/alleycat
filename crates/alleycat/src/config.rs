@@ -134,6 +134,14 @@ impl Default for AmpAgentConfig {
 pub struct OpencodeAgentConfig {
     pub enabled: bool,
     pub bin: String,
+    /// When true (default), the daemon eagerly spawns a single shared
+    /// `opencode serve --discoverable` at startup. `--discoverable` makes
+    /// the server write `~/.local/state/opencode/server.json` so a bare
+    /// local `opencode` TUI attaches to alleycat's managed server instead
+    /// of spawning its own. When false, the server is spawned lazily on the
+    /// first paired opencode session and `--discoverable` is omitted (the
+    /// pre-discoverable behavior).
+    pub discoverable: bool,
 }
 
 impl Default for OpencodeAgentConfig {
@@ -141,6 +149,7 @@ impl Default for OpencodeAgentConfig {
         Self {
             enabled: true,
             bin: "opencode".to_string(),
+            discoverable: true,
         }
     }
 }

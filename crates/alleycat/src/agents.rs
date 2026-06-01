@@ -324,6 +324,33 @@ impl AgentManager {
         &self.session_registry
     }
 
+    /// Eagerly start the single shared opencode server at daemon boot when
+    /// `[agents.opencode] enabled = true` and `discoverable = true`. This makes
+    /// the managed `opencode serve --discoverable` available immediately so a
+    /// bare local `opencode` TUI (launched before any paired alleycat opencode
+    /// session) attaches to it via `~/.local/state/opencode/server.json`
+    /// instead of spawning a competing server.
+    ///
+    /// Non-fatal: a missing or incompatible opencode binary logs a warning and
+    /// leaves the bridge uninitialized; the next paired opencode session retries
+    /// lazily through `opencode_bridge_arc`.
+    pub async fn autostart_opencode_if_discoverable(&self) {
+        let (enabled, discoverable) = {
+            let cfg = self.config.load();
+            (
+                cfg.agents.opencode.enabled,
+                cfg.agents.opencode.discoverable,
+            )
+        };
+        if !enabled || !discoverable {
+            return;
+        }
+        match self.opencode_bridge_arc().await {
+            Ok(_) => info!("opencode discoverable server autostarted"),
+            Err(error) => warn!("opencode discoverable autostart skipped: {error:#}"),
+        }
+    }
+
     /// Local loopback entrypoint for desktop clients that speak Codex's
     /// websocket app-server wire directly. For modern Codex builds Alleycat
     /// owns a Unix app-server child and bridges each accepted TCP client through
@@ -1303,12 +1330,15 @@ impl AgentManager {
     }
 
     async fn opencode_bridge_arc(&self) -> anyhow::Result<Arc<OpencodeBridge>> {
-        let bin = {
+        let (bin, discoverable) = {
             let cfg = self.config.load();
             if !cfg.agents.opencode.enabled {
                 return Err(anyhow!("opencode agent is disabled"));
             }
-            cfg.agents.opencode.bin.clone()
+            (
+                cfg.agents.opencode.bin.clone(),
+                cfg.agents.opencode.discoverable,
+            )
         };
         let bridge = self
             .opencode_bridge
@@ -1319,6 +1349,14 @@ impl AgentManager {
                 // shell set. Mirror the pre-A5 daemon behavior.
                 unsafe {
                     std::env::set_var("OPENCODE_BRIDGE_BIN", &bin);
+                    // `--discoverable` advertises this managed server in
+                    // `~/.local/state/opencode/server.json` so local TUIs
+                    // attach to it. Gated on host config so an old opencode
+                    // binary without the flag is never handed it.
+                    std::env::set_var(
+                        "OPENCODE_BRIDGE_DISCOVERABLE",
+                        if discoverable { "1" } else { "0" },
+                    );
                 }
                 OpencodeBridge::builder()
                     .from_env()

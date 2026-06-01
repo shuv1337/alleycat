@@ -67,6 +67,16 @@ impl OpencodeRuntime {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_else(|| vec!["serve".to_string()]);
+        // `--discoverable` (opencode >= the beta discovery channel) makes the
+        // server write `~/.local/state/opencode/server.json` so a bare local
+        // `opencode` TUI attaches to this managed server instead of spawning a
+        // second one. The daemon sets `OPENCODE_BRIDGE_DISCOVERABLE=1` when the
+        // host config opts in; an older opencode binary that lacks the flag
+        // would print usage and exit, so this stays config-gated.
+        let discoverable = matches!(
+            env_string(&launch_env, "OPENCODE_BRIDGE_DISCOVERABLE").as_deref(),
+            Some("1") | Some("true")
+        );
 
         let mut command = TokioCommand::new(bin);
         command
@@ -78,6 +88,9 @@ impl OpencodeRuntime {
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .kill_on_drop(true);
+        if discoverable {
+            command.arg("--discoverable");
+        }
         if let Some(token) = explicit_auth_token.as_deref() {
             command.arg(format!("--auth-token={token}"));
         }

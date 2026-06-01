@@ -155,6 +155,16 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
             }
         })
     };
+    // Eagerly bring up the shared `opencode serve --discoverable` (when the
+    // host config opts in) so local opencode TUIs attach to alleycat's server
+    // instead of spawning their own. Detached and non-fatal: failure here must
+    // never block daemon boot or the other listeners.
+    {
+        let agents = agents.clone();
+        tokio::spawn(async move {
+            agents.autostart_opencode_if_discoverable().await;
+        });
+    }
 
     let listener = ControlListener::bind()
         .await
