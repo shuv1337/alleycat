@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -14,6 +15,7 @@ pub use alleycat_bridge_core::{
 use alleycat_codex_proto::{SessionSource, Thread, ThreadSourceKind, ThreadStatus};
 
 pub const CLI_VERSION: &str = concat!("alleycat-amp-bridge/", env!("CARGO_PKG_VERSION"));
+pub const INDEX_FILE_NAME: &str = "amp-threads.json";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -105,11 +107,65 @@ impl Hydrator<AmpSessionRef> for AmpHydrator {
 }
 
 pub async fn open_and_hydrate(codex_home: &Path) -> Result<Arc<CoreThreadIndex<AmpSessionRef>>> {
-    CoreThreadIndex::open_and_hydrate(codex_home.join("threads.json"), &AmpHydrator::new()).await
+    open_and_hydrate_with(codex_home, &AmpHydrator::new()).await
+}
+
+pub async fn open_and_hydrate_with<H>(
+    codex_home: &Path,
+    hydrator: &H,
+) -> Result<Arc<CoreThreadIndex<AmpSessionRef>>>
+where
+    H: Hydrator<AmpSessionRef> + ?Sized,
+{
+    let index = CoreThreadIndex::open_at(codex_home.join(INDEX_FILE_NAME)).await?;
+    hydrate_missing_amp_threads(&index, hydrator).await?;
+    Ok(index)
+}
+
+async fn hydrate_missing_amp_threads<H>(
+    index: &CoreThreadIndex<AmpSessionRef>,
+    hydrator: &H,
+) -> Result<usize>
+where
+    H: Hydrator<AmpSessionRef> + ?Sized,
+{
+    let scanned = hydrator.scan().await?;
+    if scanned.is_empty() {
+        return Ok(0);
+    }
+
+    let mut known_amp_sessions = HashSet::new();
+    for entry in index.snapshot().await {
+        known_amp_sessions.insert(entry.thread_id);
+        if let Some(amp_thread_id) = entry.metadata.amp_thread_id {
+            known_amp_sessions.insert(amp_thread_id);
+        }
+    }
+
+    let mut added = 0;
+    for entry in scanned {
+        let amp_thread_id = entry.metadata.amp_thread_id.as_deref();
+        if known_amp_sessions.contains(&entry.thread_id)
+            || amp_thread_id.is_some_and(|id| known_amp_sessions.contains(id))
+        {
+            continue;
+        }
+
+        known_amp_sessions.insert(entry.thread_id.clone());
+        if let Some(amp_thread_id) = &entry.metadata.amp_thread_id {
+            known_amp_sessions.insert(amp_thread_id.clone());
+        }
+        index.insert(entry).await?;
+        added += 1;
+    }
+    Ok(added)
 }
 
 pub fn amp_threads_dir() -> Option<PathBuf> {
-    if let Ok(env_dir) = std::env::var("AMP_THREADS_DIR") {
+    if let Some(env_dir) = std::env::var("AMP_THREADS_DIR")
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
         return Some(expand_tilde(&env_dir));
     }
     let home = directories::UserDirs::new()?.home_dir().to_path_buf();
@@ -242,4 +298,125 @@ fn first_message_preview(value: &Value) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    async fn write_native_amp_thread(dir: &Path, id: &str, title: &str) -> PathBuf {
+        let path = dir.join(format!("{id}.json"));
+        tokio::fs::write(
+            &path,
+            json!({
+                "id": id,
+                "title": title,
+                "created": "2026-05-27T09:00:00Z",
+                "updatedAt": "2026-05-27T10:00:00Z",
+                "cwd": "/tmp/project"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn open_and_hydrate_imports_native_threads_into_amp_index() {
+        let codex_home = tempfile::tempdir().unwrap();
+        let amp_threads = tempfile::tempdir().unwrap();
+        let native_path = write_native_amp_thread(
+            amp_threads.path(),
+            "native-amp-thread",
+            "Fix mobile listing",
+        )
+        .await;
+
+        let hydrator = AmpHydrator::with_override_dir(amp_threads.path().to_path_buf());
+        let index = open_and_hydrate_with(codex_home.path(), &hydrator)
+            .await
+            .unwrap();
+
+        let page = index
+            .list(&ListFilter::default(), ListSort::default(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(page.data.len(), 1);
+        let entry = &page.data[0];
+        assert_eq!(entry.thread_id, "native-amp-thread");
+        assert_eq!(entry.name.as_deref(), Some("Fix mobile listing"));
+        assert_eq!(entry.cwd, "/tmp/project");
+        assert_eq!(
+            entry.metadata.amp_thread_id.as_deref(),
+            Some("native-amp-thread")
+        );
+        assert_eq!(
+            entry.metadata.amp_thread_path.as_deref(),
+            Some(native_path.as_path())
+        );
+        assert!(codex_home.path().join(INDEX_FILE_NAME).exists());
+        assert!(!codex_home.path().join("threads.json").exists());
+    }
+
+    #[tokio::test]
+    async fn open_and_hydrate_skips_native_thread_when_amp_session_already_indexed() {
+        let codex_home = tempfile::tempdir().unwrap();
+        let amp_threads = tempfile::tempdir().unwrap();
+        write_native_amp_thread(
+            amp_threads.path(),
+            "native-amp-thread",
+            "Native duplicate title",
+        )
+        .await;
+
+        let index =
+            CoreThreadIndex::<AmpSessionRef>::open_at(codex_home.path().join(INDEX_FILE_NAME))
+                .await
+                .unwrap();
+        index
+            .insert(IndexEntry {
+                thread_id: "app-thread".to_string(),
+                cwd: "/tmp/project".to_string(),
+                name: Some("Existing Alleycat title".to_string()),
+                preview: "Existing Alleycat preview".to_string(),
+                created_at: 1,
+                updated_at: 2,
+                archived: false,
+                forked_from_id: None,
+                model_provider: "amp".to_string(),
+                source: ThreadSourceKind::AppServer,
+                metadata: AmpSessionRef {
+                    amp_thread_id: Some("native-amp-thread".to_string()),
+                    amp_thread_path: Some(
+                        codex_home.path().join("amp-transcripts/app-thread.jsonl"),
+                    ),
+                    model: None,
+                    reasoning_effort: None,
+                },
+            })
+            .await
+            .unwrap();
+
+        let hydrator = AmpHydrator::with_override_dir(amp_threads.path().to_path_buf());
+        let hydrated = open_and_hydrate_with(codex_home.path(), &hydrator)
+            .await
+            .unwrap();
+
+        let page = hydrated
+            .list(&ListFilter::default(), ListSort::default(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(page.data.len(), 1);
+        assert_eq!(page.data[0].thread_id, "app-thread");
+        assert_eq!(
+            page.data[0].name.as_deref(),
+            Some("Existing Alleycat title")
+        );
+        assert_eq!(
+            page.data[0].metadata.amp_thread_id.as_deref(),
+            Some("native-amp-thread")
+        );
+    }
 }

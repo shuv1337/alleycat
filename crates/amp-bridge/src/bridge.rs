@@ -178,7 +178,7 @@ impl AmpBridgeBuilder {
             .await
             .with_context(|| format!("creating {}", transcripts_dir.display()))?;
 
-        let thread_index = ThreadIndex::open_at(codex_home.join("amp-threads.json")).await?;
+        let thread_index = index::open_and_hydrate(&codex_home).await?;
 
         Ok(Arc::new(AmpBridge {
             amp_bin: self
