@@ -1,5 +1,32 @@
 # Alleycat Agent Notes
 
+## ⚠️ DECOMMISSIONED (2026-06-02)
+
+Alleycat has been **decommissioned on this host**. The systemd user service
+is stopped and disabled, and the surrounding integration points that used to
+hard-depend on a running alleycat have been unwound. The rest of this file
+describes the system as it ran while active; treat it as historical reference
+until/unless alleycat is intentionally brought back.
+
+What was changed at decommission:
+
+- `systemctl --user disable --now alleycat.service` — stopped and disabled
+  (the `default.target.wants` symlink was removed). The unit file is still
+  installed; re-enable with `systemctl --user enable --now alleycat.service`.
+- The codex CLI wrapper was removed: `~/.local/bin/codex` →
+  `~/dotfiles/codex/codex` and the root symlink `/usr/local/bin/codex` →
+  `~/.local/bin/codex` were deleted, and `~/dotfiles/codex/codex` (the
+  225-line app-server-policy wrapper) was `git rm`'d from dotfiles. `codex`
+  now resolves directly to `~/.npm-global/bin/codex` with no alleycat gating.
+- The Codex Desktop launcher's alleycat hard-fail was flipped to opt-in:
+  `CODEX_DESKTOP_USE_ALLEYCAT` now defaults to `0` (built-in app-server) in
+  `~/repos/codex-desktop-linux/launcher/start.sh.template`; set it to `1` to
+  restore the websocket-bridge enforcement described below.
+
+To fully revive alleycat you would need to: re-enable the service, restore
+the codex wrapper (or re-point `~/.local/bin/codex`), and set
+`CODEX_DESKTOP_USE_ALLEYCAT=1` for Codex Desktop.
+
 ## Project overview
 
 Alleycat is a Rust workspace for an Iroh-backed daemon that multiplexes local coding-agent CLIs (Codex, Pi, Amp, OpenCode, Claude, Factory Droid, Hermes, Devin, and Grok) over a single QUIC connection for paired clients.
@@ -47,7 +74,7 @@ This fork **never** uses `CodexMode::UnixDaemon`, even when the local `codex` bu
 - `detect_codex_runtime()` (`crates/alleycat/src/agents.rs`) therefore skips the `UnixDaemon` branch and prefers `UnixProxy`. The retained `_codex_app_server_daemon_supported` probe is kept for documentation / future remote-bridge use and is `#[allow(dead_code)]`.
 - `codex_command(bin)` pins every spawned `codex …` invocation to `current_dir($HOME)` as defense-in-depth. Any daemon that does escape (e.g. via an upstream bug) at least starts from `$HOME`, not from a stale project dir.
 - Operational implication: there is **no codex app-server outside alleycat's cgroup** in steady state. If you see one, it is a regression — kill it, remove `~/.codex/app-server-daemon/app-server.pid` and `~/.codex/app-server-control/app-server-control.sock`, restart alleycat, and investigate the path that bypassed alleycat.
-- The codex CLI wrapper at `~/dotfiles/codex/codex` and the Codex Desktop launcher (`~/repos/codex-desktop-linux/launcher/start.sh.template`) both refuse to start without a healthy alleycat, so the only legitimate path to a codex app-server child is through alleycat.
+- **(Historical — see the DECOMMISSIONED banner at the top.)** While alleycat was active, the codex CLI wrapper at `~/dotfiles/codex/codex` and the Codex Desktop launcher (`~/repos/codex-desktop-linux/launcher/start.sh.template`) both refused to start without a healthy alleycat, so the only legitimate path to a codex app-server child was through alleycat. As of 2026-06-02 the wrapper has been removed and the Codex Desktop enforcement is opt-in (`CODEX_DESKTOP_USE_ALLEYCAT=1`), so this guard is no longer in effect.
 
 ### Codex remote-control supervision
 
